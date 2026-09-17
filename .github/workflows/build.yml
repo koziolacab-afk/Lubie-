@@ -1,0 +1,54 @@
+name: Build ESP32-S3 firmware
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Pobierz repo
+        uses: actions/checkout@v4
+
+      - name: Zainstaluj Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Dodaj ESP32
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+
+      - name: Zainstaluj ESP32 core
+        run: |
+          arduino-cli core install esp32:esp32
+
+      - name: Zainstaluj biblioteki
+        run: |
+          arduino-cli lib update-index
+          arduino-cli lib install "SuplaDevice"
+          arduino-cli lib install "ModbusMaster"
+
+      - name: Kompilacja
+        run: |
+          mkdir -p build
+
+          arduino-cli compile \
+            --fqbn esp32:esp32:esp32s3 \
+            --output-dir build \
+            MelcoBEMS_SUPLA
+
+      - name: Utworz firmware.bin
+        run: |
+          cp build/*.ino.bin build/firmware.bin
+          ls -lah build
+
+      - name: Zapisz firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: MelcoBEMS-firmware
+          path: build/firmware.bin
