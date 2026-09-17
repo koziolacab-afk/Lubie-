@@ -12,13 +12,51 @@
 #include <supla/sensor/virtual_thermometer.h>
 #include <supla/sensor/general_purpose_measurement.h>
 #include <supla/sensor/virtual_binary.h>
+#include <supla/control/virtual_relay.h>
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPUpdate.h>
+
+#include "esp_ota_ops.h"
 
 
 // =====================================================
-// WERSJA FIRMWARE
+// WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "1.0.1"
+
+
+// =====================================================
+// OTA
+// =====================================================
+
+const char *OTA_URL =
+  "https://github.com/koziolacab-afk/Lubie-/releases/download/ota/firmware.bin";
+
+const unsigned long OTA_VERIFY_DELAY = 60000;
+
+bool otaInProgress = false;
+bool otaPendingVerification = false;
+
+unsigned long otaVerifyStart = 0;
+unsigned long lastOtaVerifyAttempt = 0;
+
+
+// =====================================================
+// WAZNE - ODRACZAMY AUTOMATYCZNE ZATWIERDZENIE OTA
+// =====================================================
+
+// Arduino ESP32 normalnie moglby zatwierdzic firmware
+// bardzo wczesnie podczas startu.
+//
+// My chcemy sami zatwierdzic firmware dopiero wtedy,
+// gdy przez 60 sekund dziala i polaczy sie z SUPLA.
+
+extern "C" bool verifyRollbackLater() {
+  return true;
+}
 
 
 // =====================================================
@@ -45,27 +83,26 @@ Supla::EspWebServer suplaServer;
 
 
 // =====================================================
-// KANAŁY SUPLA
+// KANALY
 // =====================================================
 
-// Temperatury
 Supla::Sensor::VirtualThermometer *outdoorTemp;
 Supla::Sensor::VirtualThermometer *flowTemp;
 Supla::Sensor::VirtualThermometer *returnTemp;
 
-// KPOP / GPM
 Supla::Sensor::GeneralPurposeMeasurement *hpFrequency;
 Supla::Sensor::GeneralPurposeMeasurement *faultCode;
 Supla::Sensor::GeneralPurposeMeasurement *firmwareA1M;
 Supla::Sensor::GeneralPurposeMeasurement *modbusCounter;
 Supla::Sensor::GeneralPurposeMeasurement *systemType;
 
-// Stan pompy
 Supla::Sensor::VirtualBinary *hpRunning;
+
+Supla::Control::VirtualRelay *otaTrigger;
 
 
 // =====================================================
-// CZAS ODCZYTU MODBUS
+// MODBUS TIMER
 // =====================================================
 
 unsigned long lastModbusRead = 0;
@@ -74,12 +111,13 @@ const unsigned long MODBUS_READ_INTERVAL = 5000;
 
 
 // =====================================================
-// ODCZYT HOLDING REGISTER
+// MODBUS
 // =====================================================
 
 bool readHR(uint16_t address, uint16_t &value) {
 
-  uint8_t result = node.readHoldingRegisters(address, 1);
+  uint8_t result =
+    node.readHoldingRegisters(address, 1);
 
   if (result == node.ku8MBSuccess) {
 
@@ -98,7 +136,270 @@ bool readHR(uint16_t address, uint16_t &value) {
 
 
 // =====================================================
-// ODCZYT MODBUS -> SUPLA
+// SPRAWDZENIE STANU ROLLBACK
+// =====================================================
+
+void initRollbackState() {
+
+  const esp_partition_t *running =
+    esp_ota_get_running_partition();
+
+  esp_ota_img_states_t state;
+
+  if (esp_ota_get_state_partition(
+        running,
+        &state) == ESP_OK) {
+
+    if (state == ESP_OTA_IMG_PENDING_VERIFY) {
+
+      otaPendingVerification = true;
+      otaVerifyStart = millis();
+
+      Serial.println();
+      Serial.println("================================");
+      Serial.println("OTA: NOWY FIRMWARE");
+      Serial.println("Stan: PENDING_VERIFY");
+      Serial.println("Rollback jest aktywny");
+      Serial.println("Czekam 60 s na test firmware");
+      Serial.println("================================");
+
+      return;
+    }
+  }
+
+  Serial.println("OTA: firmware nie wymaga weryfikacji");
+}
+
+
+// =====================================================
+// ZATWIERDZENIE NOWEGO FIRMWARE
+// =====================================================
+
+void handleRollbackVerification() {
+
+  if (!otaPendingVerification) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+
+  // Najpierw musi przezyc minimum 60 sekund
+  if (now - otaVerifyStart < OTA_VERIFY_DELAY) {
+    return;
+  }
+
+
+  // Nie sprawdzamy co kazda petle
+  if (now - lastOtaVerifyAttempt < 5000) {
+    return;
+  }
+
+  lastOtaVerifyAttempt = now;
+
+
+  bool wifiOK =
+    WiFi.status() == WL_CONNECTED;
+
+  bool suplaOK =
+    SuplaDevice.getCurrentStatus() ==
+    STATUS_REGISTERED_AND_READY;
+
+
+  Serial.print("OTA VERIFY | WiFi: ");
+  Serial.print(wifiOK ? "OK" : "BRAK");
+
+  Serial.print(" | SUPLA: ");
+  Serial.println(suplaOK ? "OK" : "BRAK");
+
+
+  // Firmware zatwierdzamy dopiero gdy:
+  //
+  // 1. przepracowal minimum 60 sekund
+  // 2. WiFi dziala
+  // 3. polaczyl sie z SUPLA
+
+  if (wifiOK && suplaOK) {
+
+    esp_err_t result =
+      esp_ota_mark_app_valid_cancel_rollback();
+
+    if (result == ESP_OK) {
+
+      otaPendingVerification = false;
+
+      Serial.println();
+      Serial.println("================================");
+      Serial.println("OTA: FIRMWARE ZATWIERDZONY");
+      Serial.println("Rollback anulowany");
+      Serial.println("Nowa wersja jest teraz VALID");
+      Serial.println("================================");
+    }
+    else {
+
+      Serial.print("Blad zatwierdzenia OTA: ");
+      Serial.println(esp_err_to_name(result));
+    }
+  }
+}
+
+
+// =====================================================
+// RECZNA AKTUALIZACJA OTA
+// =====================================================
+
+void performOTA() {
+
+  if (otaInProgress) {
+    return;
+  }
+
+
+  // Nie pozwalamy instalowac kolejnego firmware,
+  // dopoki obecny firmware nie zostal zatwierdzony.
+
+  if (otaPendingVerification) {
+
+    Serial.println(
+      "OTA zablokowane - obecny firmware jest jeszcze PENDING_VERIFY"
+    );
+
+    return;
+  }
+
+
+  if (WiFi.status() != WL_CONNECTED) {
+
+    Serial.println(
+      "OTA BLAD: brak WiFi"
+    );
+
+    return;
+  }
+
+
+  otaInProgress = true;
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("START OTA");
+  Serial.print("Firmware: ");
+  Serial.println(FW_VERSION);
+  Serial.print("URL: ");
+  Serial.println(OTA_URL);
+  Serial.println("================================");
+
+
+  WiFiClientSecure client;
+
+  client.setInsecure();
+
+
+  // GitHub Release robi przekierowanie
+  // do serwera z plikiem firmware.bin.
+
+  httpUpdate.setFollowRedirects(
+    HTTPC_FORCE_FOLLOW_REDIRECTS
+  );
+
+
+  // Po udanym zapisie reboot.
+  httpUpdate.rebootOnUpdate(true);
+
+
+  httpUpdate.onStart([]() {
+
+    Serial.println("OTA: pobieranie...");
+  });
+
+
+  httpUpdate.onProgress(
+    [](int current, int total) {
+
+      if (total <= 0) {
+        return;
+      }
+
+      int percent =
+        (current * 100) / total;
+
+      static int lastPercent = -1;
+
+      if (percent != lastPercent &&
+          percent % 10 == 0) {
+
+        lastPercent = percent;
+
+        Serial.print("OTA: ");
+        Serial.print(percent);
+        Serial.println("%");
+      }
+    }
+  );
+
+
+  httpUpdate.onEnd([]() {
+
+    Serial.println("OTA: zapis zakonczony");
+    Serial.println("Restart...");
+  });
+
+
+  httpUpdate.onError([](int error) {
+
+    Serial.print("OTA BLAD: ");
+    Serial.println(error);
+
+    Serial.print("Opis: ");
+    Serial.println(
+      httpUpdate.getLastErrorString()
+    );
+  });
+
+
+  t_httpUpdate_return result =
+    httpUpdate.update(
+      client,
+      OTA_URL
+    );
+
+
+  switch (result) {
+
+    case HTTP_UPDATE_FAILED:
+
+      Serial.println(
+        "OTA zakonczone bledem"
+      );
+
+      break;
+
+
+    case HTTP_UPDATE_NO_UPDATES:
+
+      Serial.println(
+        "OTA: brak aktualizacji"
+      );
+
+      break;
+
+
+    case HTTP_UPDATE_OK:
+
+      Serial.println(
+        "OTA OK"
+      );
+
+      break;
+  }
+
+
+  otaInProgress = false;
+}
+
+
+// =====================================================
+// MODBUS -> SUPLA
 // =====================================================
 
 void readModbus() {
@@ -106,16 +407,15 @@ void readModbus() {
   uint16_t raw;
 
 
-  // -------------------------------------------------
-  // 99 - Outdoor Ambient Temperature
-  // int16, x10
-  // -------------------------------------------------
+  // 99 - Outdoor temperature x10
 
   if (readHR(99, raw)) {
 
-    int16_t value = (int16_t)raw;
+    int16_t value =
+      (int16_t)raw;
 
-    double temp = value / 10.0;
+    double temp =
+      value / 10.0;
 
     outdoorTemp->setValue(temp);
 
@@ -125,16 +425,15 @@ void readModbus() {
   }
 
 
-  // -------------------------------------------------
-  // 101 - Flow Temperature
-  // int16, x100
-  // -------------------------------------------------
+  // 101 - Flow temperature x100
 
   if (readHR(101, raw)) {
 
-    int16_t value = (int16_t)raw;
+    int16_t value =
+      (int16_t)raw;
 
-    double temp = value / 100.0;
+    double temp =
+      value / 100.0;
 
     flowTemp->setValue(temp);
 
@@ -144,16 +443,15 @@ void readModbus() {
   }
 
 
-  // -------------------------------------------------
-  // 103 - Return Temperature
-  // int16, x100
-  // -------------------------------------------------
+  // 103 - Return temperature x100
 
   if (readHR(103, raw)) {
 
-    int16_t value = (int16_t)raw;
+    int16_t value =
+      (int16_t)raw;
 
-    double temp = value / 100.0;
+    double temp =
+      value / 100.0;
 
     returnTemp->setValue(temp);
 
@@ -163,10 +461,7 @@ void readModbus() {
   }
 
 
-  // -------------------------------------------------
   // 73 - Heat Pump Frequency
-  // uint16, Hz
-  // -------------------------------------------------
 
   if (readHR(73, raw)) {
 
@@ -178,18 +473,17 @@ void readModbus() {
   }
 
 
-  // -------------------------------------------------
-  // 127 - Heat Pump RUN / STOP
-  // 0 = STOP
-  // 1 = RUN
-  // -------------------------------------------------
+  // 127 - RUN / STOP
 
   if (readHR(127, raw)) {
 
     if (raw == 1) {
+
       hpRunning->set();
+
     }
     else {
+
       hpRunning->clear();
     }
 
@@ -198,63 +492,38 @@ void readModbus() {
   }
 
 
-  // -------------------------------------------------
-  // 9 - Fault / Error Code
-  //
-  // 0x8000 = brak bledu
-  // 0x6999 = problem komunikacji
-  // -------------------------------------------------
+  // 9 - Fault
 
   if (readHR(9, raw)) {
 
     faultCode->setValue(raw);
 
-    Serial.print("Fault code: 0x");
+    Serial.print("Fault: 0x");
     Serial.println(raw, HEX);
   }
 
 
-  // -------------------------------------------------
-  // 10 - Firmware MelcoBEMS
-  // -------------------------------------------------
+  // 10 - MelcoBEMS firmware
 
   if (readHR(10, raw)) {
 
     firmwareA1M->setValue(raw);
-
-    Serial.print("Melco firmware raw: ");
-    Serial.println(raw);
   }
 
 
-  // -------------------------------------------------
-  // 11 - Modbus communication counter
-  // -------------------------------------------------
+  // 11 - Modbus counter
 
   if (readHR(11, raw)) {
 
     modbusCounter->setValue(raw);
-
-    Serial.print("Modbus counter: ");
-    Serial.println(raw);
   }
 
 
-  // -------------------------------------------------
-  // 13 - System Type
-  //
-  // 0   = ATA
-  // 1   = ATW
-  // 2   = Lossnay
-  // 255 = undetermined
-  // -------------------------------------------------
+  // 13 - System type
 
   if (readHR(13, raw)) {
 
     systemType->setValue(raw);
-
-    Serial.print("System type: ");
-    Serial.println(raw);
   }
 
 
@@ -280,9 +549,7 @@ void setup() {
   Serial.println("==============================");
 
 
-  // -------------------------------------------------
   // MODBUS
-  // -------------------------------------------------
 
   RS485.begin(
     MODBUS_BAUD,
@@ -297,18 +564,18 @@ void setup() {
   );
 
 
-  // -------------------------------------------------
-  // STRONA KONFIGURACYJNA SUPLA
-  // -------------------------------------------------
+  // SUPLA WWW
 
-  new Supla::Html::DeviceInfo(&SuplaDevice);
+  new Supla::Html::DeviceInfo(
+    &SuplaDevice
+  );
+
   new Supla::Html::WifiParameters;
+
   new Supla::Html::ProtocolParameters;
 
 
-  // -------------------------------------------------
   // TEMPERATURY
-  // -------------------------------------------------
 
   outdoorTemp =
     new Supla::Sensor::VirtualThermometer();
@@ -320,92 +587,103 @@ void setup() {
     new Supla::Sensor::VirtualThermometer();
 
 
-  // -------------------------------------------------
-  // CZESTOTLIWOSC
-  // -------------------------------------------------
+  // FREQUENCY
 
   hpFrequency =
     new Supla::Sensor::GeneralPurposeMeasurement();
 
-  hpFrequency->setDefaultUnitAfterValue("Hz");
-  hpFrequency->setDefaultValuePrecision(0);
+  hpFrequency->
+    setDefaultUnitAfterValue("Hz");
+
+  hpFrequency->
+    setDefaultValuePrecision(0);
 
 
-  // -------------------------------------------------
-  // RUN / STOP
-  // -------------------------------------------------
+  // RUN
 
   hpRunning =
     new Supla::Sensor::VirtualBinary();
 
 
-  // -------------------------------------------------
-  // FAULT CODE
-  // -------------------------------------------------
+  // FAULT
 
   faultCode =
     new Supla::Sensor::GeneralPurposeMeasurement();
 
-  faultCode->setDefaultValuePrecision(0);
+  faultCode->
+    setDefaultValuePrecision(0);
 
 
-  // -------------------------------------------------
-  // MELCO FIRMWARE
-  // -------------------------------------------------
+  // MELCO FW
 
   firmwareA1M =
     new Supla::Sensor::GeneralPurposeMeasurement();
 
-  firmwareA1M->setDefaultValuePrecision(0);
+  firmwareA1M->
+    setDefaultValuePrecision(0);
 
 
-  // -------------------------------------------------
   // MODBUS COUNTER
-  // -------------------------------------------------
 
   modbusCounter =
     new Supla::Sensor::GeneralPurposeMeasurement();
 
-  modbusCounter->setDefaultValuePrecision(0);
+  modbusCounter->
+    setDefaultValuePrecision(0);
 
 
-  // -------------------------------------------------
   // SYSTEM TYPE
-  // -------------------------------------------------
 
   systemType =
     new Supla::Sensor::GeneralPurposeMeasurement();
 
-  systemType->setDefaultValuePrecision(0);
+  systemType->
+    setDefaultValuePrecision(0);
 
 
-  // -------------------------------------------------
-  // DANE URZADZENIA
-  // -------------------------------------------------
+  // OTA BUTTON
 
-  SuplaDevice.setName("Mitsubishi MelcoBEMS");
+  otaTrigger =
+    new Supla::Control::VirtualRelay();
 
-  SuplaDevice.setSwVersion(FW_VERSION);
+  otaTrigger->setDefaultFunction(
+    SUPLA_CHANNELFNC_POWERSWITCH
+  );
+
+  otaTrigger->setDefaultStateOff();
 
 
-  // Przy pierwszym uruchomieniu / factory reset:
-  // uruchomi AP i strone konfiguracji.
-  //
-  // Gdy konfiguracja jest juz zapisana w LittleFS:
-  // normalnie polaczy sie z WiFi i SUPLA.
+  // DEVICE
+
+  SuplaDevice.setName(
+    "Mitsubishi MelcoBEMS"
+  );
+
+  SuplaDevice.setSwVersion(
+    FW_VERSION
+  );
 
   SuplaDevice.setInitialMode(
     Supla::InitialMode::StartInCfgMode
   );
 
 
-  // -------------------------------------------------
-  // START SUPLA
-  // -------------------------------------------------
-
   SuplaDevice.begin();
 
+
   Serial.println("SUPLA uruchomiona");
+
+
+  // Sprawdz czy jestesmy po OTA
+  // i czy trzeba zatwierdzic firmware.
+
+  initRollbackState();
+
+
+  Serial.print("Free sketch space: ");
+  Serial.println(
+    ESP.getFreeSketchSpace()
+  );
 }
 
 
@@ -415,12 +693,49 @@ void setup() {
 
 void loop() {
 
-  // SUPLA musi byc wywolywana bardzo czesto
   SuplaDevice.iterate();
 
 
-  // Odczyt Modbus co 5 sekund
-  if (millis() - lastModbusRead >= MODBUS_READ_INTERVAL) {
+  // -------------------------------------------------
+  // WALIDACJA NOWEGO FIRMWARE
+  // -------------------------------------------------
+
+  handleRollbackVerification();
+
+
+  // -------------------------------------------------
+  // PRZYCISK OTA
+  // -------------------------------------------------
+
+  if (otaTrigger->isOn() &&
+      !otaInProgress) {
+
+    Serial.println();
+    Serial.println(
+      "OTA wyzwolone z SUPLA"
+    );
+
+
+    // Wylaczamy przycisk od razu.
+
+    otaTrigger->turnOff();
+
+    SuplaDevice.iterate();
+
+    delay(250);
+
+
+    performOTA();
+  }
+
+
+  // -------------------------------------------------
+  // MODBUS
+  // -------------------------------------------------
+
+  if (!otaInProgress &&
+      millis() - lastModbusRead >=
+      MODBUS_READ_INTERVAL) {
 
     lastModbusRead = millis();
 
