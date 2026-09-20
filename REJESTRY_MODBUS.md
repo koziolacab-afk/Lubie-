@@ -1,6 +1,6 @@
 # Rejestry Modbus w firmware
 
-Stan mapowania: firmware 1.0.12 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
+Stan mapowania: firmware 1.0.13 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
 Adresy ponizej to adresy przekazywane wprost do `readHoldingRegisters(adres, 1)`
 (adresowanie od zera w ramce Modbus), a nie numeracja 4xxxx z niektorych
 programow. Jezeli program konfiguracyjny numeruje rejestry od 1, sprawdz jego
@@ -11,9 +11,9 @@ Kazda pompa jest niezalezna:
 
 | Slave ID | Pompa | Kanaly SUPLA powiazane z pompa |
 | ---: | --- | --- |
-| 1 | CAHV 1 | 0-5, 10-14, 43, 46-47 |
-| 2 | CAHV 2 | 15-20, 24-28, 44, 48-49 |
-| 3 | QAHV | 29-34, 38-42, 45, 50-51 |
+| 1 | CAHV 1 | 0-5, 10-14, 43, 46-47, 66 |
+| 2 | CAHV 2 | 15-20, 24-28, 44, 48-49, 67 |
+| 3 | QAHV | 29-34, 38-42, 45, 50-51, 68 |
 
 Wszystkie wpisy w tabeli sa **odczytami holding register, funkcja 03**.
 Interwal jest celem harmonogramu dla kazdej pompy osobno; rzeczywista
@@ -54,6 +54,12 @@ Te kanaly **nie sa osobnymi rejestrami Modbus**:
 | 12 / 26 / 40 | Komunikacja Modbus: stan lacznosci z danym slave'em; przy braku odpowiedzi odpytywany jest rejestr 99 co 10 s |
 | 46 / 48 / 50 | Delta temperatury: odczyt 101 minus odczyt 103, w °C |
 | 47 / 49 / 51 | Zaobserwowane starty sprezarki: zliczane przejscia czestotliwosci rejestru 73 z zera na wartosc dodatnia; licznik przechowywany w NVS ESP32 |
+| 66 / 67 / 68 | Szacowany czas pracy sprezarki: dodatnia czestotliwosc z rejestru 73; godziny sumowane od uruchomienia tej funkcji, zapisywane w NVS co 5 minut i po zatrzymaniu |
+
+Czas jest liczony tylko przy swiezym odczycie czestotliwosci (do 30 s) i
+polaczeniu z danym slave'em. Podczas zaniku komunikacji nie jest doliczany.
+To szacunek ESP, a nie fabryczny licznik czasu pracy pompy. Rejestry 136/137
+sa odczytywane jedynie dla CAHV, nie dla QAHV.
 
 Kanaly 6-8, 21-23 i 35-37 (Firmware A1M, Licznik Modbus, Typ systemu)
 sa zachowane w SUPLA dla zgodnosci identyfikatorow z istniejacym urzadzeniem,

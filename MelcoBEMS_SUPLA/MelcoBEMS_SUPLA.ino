@@ -31,7 +31,7 @@
 // WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.12"
+#define FW_VERSION "1.0.13"
 
 
 // =====================================================
@@ -190,6 +190,7 @@ struct PumpChannels {
   Supla::Sensor::VirtualThermometer *thermoOff;
   Supla::Sensor::GeneralPurposeMeasurement *temperatureDelta;
   Supla::Sensor::GeneralPurposeMeasurement *compressorStarts;
+  Supla::Sensor::GeneralPurposeMeasurement *compressorRuntime;
 };
 
 PumpChannels pumpChannels[PUMP_COUNT] = {};
@@ -289,6 +290,13 @@ struct PumpState {
   bool frequencyKnown;
   bool compressorRunning;
   uint32_t compressorStarts;
+  uint64_t compressorRuntimeMs;
+  uint64_t savedCompressorRuntimeMs;
+  uint64_t publishedRuntimeHundredths;
+  uint32_t lastRuntimeTick;
+  uint32_t lastFrequencySample;
+  uint32_t lastRuntimeSaveFailure;
+  bool runtimeSaveFailed;
   int32_t lastDefrostDescription;
   int32_t lastOperatingDescription;
   int32_t lastFaultDescription;
@@ -297,6 +305,9 @@ struct PumpState {
 PumpState pumpState[PUMP_COUNT] = {};
 
 const char *const START_COUNT_KEYS[PUMP_COUNT] = {"s1", "s2", "s3"};
+const char *const RUNTIME_KEYS[PUMP_COUNT] = {"h1", "h2", "h3"};
+const uint32_t RUNTIME_SAVE_INTERVAL_MS = 300000;
+const uint32_t FREQUENCY_MAX_AGE_MS = 30000;
 
 void loadCompressorStartCounts() {
   Preferences preferences;
@@ -324,6 +335,70 @@ void saveCompressorStartCount(uint8_t pump) {
     Serial.println("Blad zapisu licznika startow do NVS");
   }
   preferences.end();
+}
+
+void loadCompressorRuntime() {
+  Preferences preferences;
+  bool opened = preferences.begin("melco-hours", true);
+  if (!opened) Serial.println("Nie mozna odczytac czasu sprezarek z NVS");
+  for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
+    PumpState &state = pumpState[pump];
+    state.compressorRuntimeMs = opened ?
+      preferences.getULong64(RUNTIME_KEYS[pump], 0) : 0;
+    state.savedCompressorRuntimeMs = state.compressorRuntimeMs;
+    state.publishedRuntimeHundredths = state.compressorRuntimeMs / 36000ULL;
+    state.lastRuntimeTick = millis();
+    pumpChannels[pump].compressorRuntime->setValue(
+      state.compressorRuntimeMs / 3600000.0);
+  }
+  if (opened) preferences.end();
+}
+
+void saveCompressorRuntime(uint8_t pump) {
+  PumpState &state = pumpState[pump];
+  if (state.compressorRuntimeMs == state.savedCompressorRuntimeMs) return;
+  if (state.runtimeSaveFailed &&
+      millis() - state.lastRuntimeSaveFailure < 60000) return;
+  Preferences preferences;
+  if (!preferences.begin("melco-hours", false)) {
+    Serial.println("Nie mozna zapisac czasu sprezarek do NVS");
+    state.runtimeSaveFailed = true;
+    state.lastRuntimeSaveFailure = millis();
+    return;
+  }
+  if (preferences.putULong64(RUNTIME_KEYS[pump],
+                             state.compressorRuntimeMs) == sizeof(uint64_t)) {
+    state.savedCompressorRuntimeMs = state.compressorRuntimeMs;
+    state.runtimeSaveFailed = false;
+  } else {
+    Serial.println("Blad zapisu czasu sprezarek do NVS");
+    state.runtimeSaveFailed = true;
+    state.lastRuntimeSaveFailure = millis();
+  }
+  preferences.end();
+}
+
+void updateCompressorRuntime(uint8_t pump) {
+  PumpState &state = pumpState[pump];
+  uint32_t now = millis();
+  uint32_t elapsed = now - state.lastRuntimeTick;
+  state.lastRuntimeTick = now;
+
+  if (state.online && state.frequencyKnown && state.compressorRunning &&
+      now - state.lastFrequencySample <= FREQUENCY_MAX_AGE_MS) {
+    state.compressorRuntimeMs += elapsed;
+  }
+
+  uint64_t hundredths = state.compressorRuntimeMs / 36000ULL;
+  if (hundredths != state.publishedRuntimeHundredths) {
+    state.publishedRuntimeHundredths = hundredths;
+    pumpChannels[pump].compressorRuntime->setValue(
+      state.compressorRuntimeMs / 3600000.0);
+  }
+  if (state.compressorRuntimeMs - state.savedCompressorRuntimeMs >=
+      RUNTIME_SAVE_INTERVAL_MS) {
+    saveCompressorRuntime(pump);
+  }
 }
 
 
@@ -429,6 +504,7 @@ void setModbusOnline(uint8_t pump, bool online) {
     return;
   }
 
+  updateCompressorRuntime(pump);
 
   state.stateKnown = true;
   state.online = online;
@@ -437,6 +513,8 @@ void setModbusOnline(uint8_t pump, bool online) {
     state.haveFlow = false;
     state.haveReturn = false;
     state.frequencyKnown = false;
+    state.compressorRunning = false;
+    saveCompressorRuntime(pump);
   }
 
 
@@ -640,6 +718,7 @@ void applyRegisterValue(
 
     case REG_FREQUENCY: {
 
+      updateCompressorRuntime(pump);
       channels.frequency->setValue(raw);
 
       if (raw <= 255) {
@@ -652,6 +731,12 @@ void applyRegisterValue(
         }
         state.compressorRunning = running;
         state.frequencyKnown = true;
+        state.lastFrequencySample = millis();
+        if (!running) saveCompressorRuntime(pump);
+      } else {
+        state.frequencyKnown = false;
+        state.compressorRunning = false;
+        saveCompressorRuntime(pump);
       }
 
       break;
@@ -871,7 +956,8 @@ void configureGpmHistory(bool notifyCloud) {
     Supla::Sensor::GeneralPurposeMeasurement *measurements[] = {
       channels.frequency, channels.fault, channels.defrost,
       channels.mode, channels.systemOn, channels.runtimeHours,
-      channels.temperatureDelta, channels.compressorStarts
+      channels.temperatureDelta, channels.compressorStarts,
+      channels.compressorRuntime
     };
     for (auto *measurement : measurements) {
       if (!measurement) continue;
@@ -2003,6 +2089,17 @@ void createSuplaChannels() {
     physicalRelay[relay]->setDefaultFunction(SUPLA_CHANNELFNC_POWERSWITCH);
     physicalRelay[relay]->setDefaultStateOff();
   }
+
+  // Nowe kanaly na koncu; numery i typy kanalow 0-65 pozostaja bez zmian.
+  for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
+    PumpChannels &channels = pumpChannels[pump];
+    channels.compressorRuntime = new Supla::Sensor::GeneralPurposeMeasurement();
+    numberChannel(channels.compressorRuntime, 66 + pump);
+    namePumpChannel(channels.compressorRuntime, pump,
+                    "Szacowany czas pracy sprezarki");
+    channels.compressorRuntime->setDefaultUnitAfterValue("h");
+    channels.compressorRuntime->setDefaultValuePrecision(2);
+  }
 }
 
 
@@ -2091,6 +2188,7 @@ void setup() {
   createSuplaChannels();
   configureGpmHistory(false);
   loadCompressorStartCounts();
+  loadCompressorRuntime();
   initDsSensors();
 
   for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
@@ -2192,6 +2290,11 @@ void loop() {
 
     SuplaDevice.iterate();
 
+    for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
+      updateCompressorRuntime(pump);
+      saveCompressorRuntime(pump);
+    }
+
 
     delay(
       250
@@ -2208,4 +2311,7 @@ void loop() {
 
   handleDsSensors();
   handleModbusScheduler();
+  for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
+    updateCompressorRuntime(pump);
+  }
 }
