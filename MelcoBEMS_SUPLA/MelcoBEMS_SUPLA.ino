@@ -26,7 +26,7 @@
 // WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.8"
+#define FW_VERSION "1.0.9"
 
 
 // =====================================================
@@ -77,6 +77,7 @@ const char *const PUMP_NAMES[PUMP_COUNT] = {"CAHV 1", "CAHV 2", "QAHV"};
 
 HardwareSerial RS485(1);
 ModbusMaster node;
+uint8_t lastModbusError[PUMP_COUNT] = {};
 
 
 // =====================================================
@@ -170,7 +171,7 @@ enum RegisterType {
   REG_FIRMWARE,
   REG_COUNTER,
   REG_SYSTEM_TYPE,
-  REG_SETTING_WATER,
+  REG_FLOW_SETPOINT,
   REG_SYSTEM_ON,
   REG_RUNTIME_HOURS,
   REG_RUNTIME_HUNDREDS,
@@ -203,7 +204,7 @@ ModbusPollItem pollItems[] = {
   {67,  5000, {0}, REG_DEFROST, ALL_PUMPS},
   {26,  5000, {0}, REG_OPERATING_MODE, ALL_PUMPS},
   {9,   5000, {0}, REG_FAULT, ALL_PUMPS},
-  {52,  5000, {0}, REG_SETTING_WATER, ALL_PUMPS},
+  {85,  5000, {0}, REG_FLOW_SETPOINT, ALL_PUMPS},
   {25,  5000, {0}, REG_SYSTEM_ON, ALL_PUMPS},
 
   {10, 60000, {0}, REG_FIRMWARE, ALL_PUMPS},
@@ -342,23 +343,7 @@ bool readHR(
   }
 
 
-  Serial.print(
-    "Modbus ERROR slave "
-  );
-
-  Serial.print(PUMP_SLAVE_IDS[pump]);
-  Serial.print(" addr ");
-  Serial.print(address);
-
-  Serial.print(
-    " -> 0x"
-  );
-
-  Serial.println(
-    result,
-    HEX
-  );
-
+  lastModbusError[pump] = result;
 
   return false;
 }
@@ -542,9 +527,6 @@ void applyRegisterValue(
   PumpChannels &channels = pumpChannels[pump];
   PumpState &state = pumpState[pump];
 
-  Serial.print(PUMP_NAMES[pump]);
-  Serial.print(" - ");
-
   switch (type) {
 
 
@@ -560,10 +542,6 @@ void applyRegisterValue(
         ((int16_t)raw) / 10.0;
 
       channels.outdoor->setValue(value);
-
-      Serial.print("Outdoor: ");
-      Serial.print(value);
-      Serial.println(" C");
 
       break;
     }
@@ -582,10 +560,6 @@ void applyRegisterValue(
 
       channels.outlet->setValue(value);
 
-      Serial.print("Flow: ");
-      Serial.print(value);
-      Serial.println(" C");
-
       break;
     }
 
@@ -603,10 +577,6 @@ void applyRegisterValue(
 
       channels.inlet->setValue(value);
 
-      Serial.print("Return: ");
-      Serial.print(value);
-      Serial.println(" C");
-
       break;
     }
 
@@ -619,14 +589,6 @@ void applyRegisterValue(
     case REG_FREQUENCY: {
 
       channels.frequency->setValue(raw);
-
-      Serial.print(
-        "HP Frequency: "
-      );
-
-      Serial.print(raw);
-
-      Serial.println(" Hz");
 
       break;
     }
@@ -649,12 +611,6 @@ void applyRegisterValue(
       }
 
 
-      Serial.print(
-        "HP Run: "
-      );
-
-      Serial.println(raw);
-
       break;
     }
 
@@ -671,12 +627,6 @@ void applyRegisterValue(
       state.defrost = raw;
       state.haveDefrost = true;
 
-
-      Serial.print(
-        "Defrost: "
-      );
-
-      Serial.println(raw);
 
       break;
     }
@@ -695,12 +645,6 @@ void applyRegisterValue(
       state.haveOperatingMode = true;
 
 
-      Serial.print(
-        "Operating mode: "
-      );
-
-      Serial.println(raw);
-
       break;
     }
 
@@ -718,15 +662,6 @@ void applyRegisterValue(
       state.haveFault = true;
 
 
-      Serial.print(
-        "Fault: 0x"
-      );
-
-      Serial.println(
-        raw,
-        HEX
-      );
-
       break;
     }
 
@@ -740,12 +675,6 @@ void applyRegisterValue(
 
       channels.firmware->setValue(raw);
 
-      Serial.print(
-        "Melco firmware: "
-      );
-
-      Serial.println(raw);
-
       break;
     }
 
@@ -758,12 +687,6 @@ void applyRegisterValue(
     case REG_COUNTER: {
 
       channels.counter->setValue(raw);
-
-      Serial.print(
-        "Modbus counter: "
-      );
-
-      Serial.println(raw);
 
       break;
     }
@@ -782,25 +705,15 @@ void applyRegisterValue(
       state.haveSystemType = true;
 
 
-      Serial.print(
-        "System type: "
-      );
-
-      Serial.println(raw);
-
       break;
     }
 
-    case REG_SETTING_WATER:
+    case REG_FLOW_SETPOINT:
       channels.settingWater->setValue(((int16_t)raw) / 100.0);
-      Serial.print("Setting water: ");
-      Serial.println(((int16_t)raw) / 100.0);
       break;
 
     case REG_SYSTEM_ON:
       channels.systemOn->setValue(raw);
-      Serial.print("System on/off: ");
-      Serial.println(raw);
       break;
 
     case REG_RUNTIME_HOURS:
@@ -815,8 +728,6 @@ void applyRegisterValue(
 
     case REG_THERMO_OFF:
       channels.thermoOff->setValue(((int16_t)raw) / 100.0);
-      Serial.print("Thermo-off: ");
-      Serial.println(((int16_t)raw) / 100.0);
       break;
   }
 
@@ -841,9 +752,6 @@ void applyRegisterValue(
 void handleOfflineModbusProbe(uint8_t pump) {
   PumpState &state = pumpState[pump];
   uint16_t raw;
-
-  Serial.print("MODBUS: probe slave ");
-  Serial.println(PUMP_SLAVE_IDS[pump]);
 
   bool ok = readHR(pump, 99, raw);
   lastModbusTransaction = millis();
@@ -904,11 +812,13 @@ void handleModbusScheduler() {
         applyRegisterValue(pump, item.type, raw);
       } else {
         if (state.failures < 255) state.failures++;
-        Serial.print("Modbus failure streak slave ");
-        Serial.print(PUMP_SLAVE_IDS[pump]);
-        Serial.print(": ");
-        Serial.println(state.failures);
         if (state.failures >= 3) {
+          Serial.print("MODBUS slave ");
+          Serial.print(PUMP_SLAVE_IDS[pump]);
+          Serial.print(" addr ");
+          Serial.print(item.address);
+          Serial.print(" error 0x");
+          Serial.println(lastModbusError[pump], HEX);
           setModbusOnline(pump, false);
           state.failures = 0;
           state.nextProbe = millis() + MODBUS_OFFLINE_RETRY;
@@ -924,22 +834,33 @@ void handleModbusScheduler() {
 // HISTORIA GPM
 // =====================================================
 
-void configureGpmHistory() {
+void configureGpmHistory(bool notifyCloud) {
   bool changed = false;
+  uint8_t enabled = 0;
+  uint8_t total = 0;
   for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
     PumpChannels &channels = pumpChannels[pump];
     Supla::Sensor::GeneralPurposeMeasurement *measurements[] = {
-      channels.frequency, channels.fault, channels.defrost,
+      channels.frequency, channels.fault, channels.firmware,
+      channels.counter, channels.systemType, channels.defrost,
       channels.mode, channels.systemOn, channels.runtimeHours
     };
     for (auto *measurement : measurements) {
-      if (measurement && measurement->getKeepHistory() != 1) {
-        measurement->setKeepHistory(1);
+      if (!measurement) continue;
+      total++;
+      if (measurement->getKeepHistory() != 1) {
+        measurement->setKeepHistory(1, notifyCloud);
         changed = true;
       }
+      enabled += measurement->getKeepHistory() == 1;
     }
   }
-  if (changed) Serial.println("SUPLA: wlaczono historie pomiarow GPM");
+  if (notifyCloud && (!historyConfigured || changed)) {
+    Serial.print("SUPLA GPM KeepHistory local: ");
+    Serial.print(enabled);
+    Serial.print("/");
+    Serial.println(total);
+  }
 }
 
 
@@ -1012,7 +933,7 @@ void updateStatusDescriptions() {
   // Historia ustawiana po synchronizacji
   // konfiguracji z Cloud.
   if (!historyConfigured || millis() - lastHistoryCheck >= 60000) {
-    configureGpmHistory();
+    configureGpmHistory(true);
     historyConfigured = true;
     lastHistoryCheck = millis();
   }
@@ -1822,7 +1743,7 @@ void createSuplaChannels() {
 
   // 13-14: dodatkowe odczyty CAHV 1.
   first.settingWater = new Supla::Sensor::VirtualThermometer();
-  namePumpChannel(first.settingWater, 0, "Temperatura zadana wody");
+  namePumpChannel(first.settingWater, 0, "Nastawa temperatury wylotu");
   first.systemOn = new Supla::Sensor::GeneralPurposeMeasurement();
   namePumpChannel(first.systemOn, 0, "System ON/OFF");
   first.systemOn->setDefaultValuePrecision(0);
@@ -1867,7 +1788,7 @@ void createSuplaChannels() {
     namePumpChannel(channels.online, pump, "Komunikacja Modbus");
     channels.online->clear();
     channels.settingWater = new Supla::Sensor::VirtualThermometer();
-    namePumpChannel(channels.settingWater, pump, "Temperatura zadana wody");
+    namePumpChannel(channels.settingWater, pump, "Nastawa temperatury wylotu");
     channels.systemOn = new Supla::Sensor::GeneralPurposeMeasurement();
     namePumpChannel(channels.systemOn, pump, "System ON/OFF");
     channels.systemOn->setDefaultValuePrecision(0);
@@ -1964,6 +1885,7 @@ void setup() {
   // =================================================
 
   createSuplaChannels();
+  configureGpmHistory(false);
 
   for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
     pumpState[pump].nextProbe = millis() + 1500;
