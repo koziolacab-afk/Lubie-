@@ -35,6 +35,8 @@ jobs:
           arduino-cli lib update-index
           arduino-cli lib install "SuplaDevice"
           arduino-cli lib install "ModbusMaster"
+          arduino-cli lib install "OneWire"
+          arduino-cli lib install "DallasTemperature"
 
       - name: Kompilacja
         run: |

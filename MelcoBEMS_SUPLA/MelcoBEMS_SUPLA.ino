@@ -13,11 +13,15 @@
 #include <supla/sensor/general_purpose_measurement.h>
 #include <supla/sensor/virtual_binary.h>
 #include <supla/control/virtual_relay.h>
+#include <supla/control/relay.h>
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPUpdate.h>
 #include <Preferences.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <string.h>
 
 #include "esp_ota_ops.h"
 #include "esp_err.h"
@@ -27,7 +31,7 @@
 // WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.10"
+#define FW_VERSION "1.0.11"
 
 
 // =====================================================
@@ -80,13 +84,49 @@ HardwareSerial RS485(1);
 ModbusMaster node;
 uint8_t lastModbusError[PUMP_COUNT] = {};
 
+const uint8_t TANK_COUNT = 5;
+const uint8_t DS_SENSOR_COUNT = 8;
+const uint8_t DS_DATA_PIN = 4;
+const uint8_t RELAY_COUNT = 5;
+const uint8_t RELAY_PINS[RELAY_COUNT] = {1, 2, 41, 42, 45};
+const double TANK_VOLUME_LITERS = 1000.0;
+const double CWU_COLD_REFERENCE_C = 10.0;
+const unsigned long DS_READ_INTERVAL = 15000;
+const unsigned long DS_CONVERSION_TIME = 800;
+
+OneWire oneWire(DS_DATA_PIN);
+DallasTemperature dsBus(&oneWire);
+DeviceAddress dsAddress[DS_SENSOR_COUNT] = {};
+bool dsBound[DS_SENSOR_COUNT] = {};
+Supla::Sensor::VirtualThermometer *dsChannel[DS_SENSOR_COUNT] = {};
+Supla::Sensor::GeneralPurposeMeasurement *cwuEnergy = nullptr;
+Supla::Control::Relay *physicalRelay[RELAY_COUNT] = {};
+bool dsConversionPending = false;
+unsigned long dsConversionStarted = 0;
+unsigned long lastDsDiscovery = 0;
+
+const char *const DS_KEYS[DS_SENSOR_COUNT] = {
+  "d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8"
+};
+const char *const DS_CAPTIONS[DS_SENSOR_COUNT] = {
+  "CWU zbiornik 1 - srodek", "CWU zbiornik 2 - srodek",
+  "CWU zbiornik 3 - srodek", "CWU zbiornik 4 - srodek",
+  "CWU zbiornik 5 - srodek", "Kociol olejowy - temperatura",
+  "Kociol olejowy - zasilanie CO", "Kociol olejowy - zasilanie CWU"
+};
+const char *const RELAY_CAPTIONS[RELAY_COUNT] = {
+  "Kociol olejowy - zalaczanie", "Kociol olejowy - pompa CO",
+  "Kociol olejowy - pompa CWU", "CAHV 1 - tryb reczny",
+  "CAHV 2 - tryb reczny"
+};
+
 
 // =====================================================
 // SUPLA
 // =====================================================
 
 Supla::ESPWifi wifi;
-// The default 1024-byte config buffer cannot hold settings for all 46 channels.
+// The default 1024-byte config buffer cannot hold settings for all channels.
 Supla::LittleFsConfig configSupla(16384);
 Supla::EspWebServer suplaServer;
 
@@ -113,15 +153,6 @@ Supla::Sensor::VirtualBinary *hpRunning;
 // 5
 Supla::Sensor::GeneralPurposeMeasurement *faultCode;
 
-// 6
-Supla::Sensor::GeneralPurposeMeasurement *firmwareA1M;
-
-// 7
-Supla::Sensor::GeneralPurposeMeasurement *modbusCounter;
-
-// 8
-Supla::Sensor::GeneralPurposeMeasurement *systemType;
-
 // 9
 Supla::Control::VirtualRelay *otaTrigger;
 
@@ -141,9 +172,6 @@ struct PumpChannels {
   Supla::Sensor::GeneralPurposeMeasurement *frequency;
   Supla::Sensor::VirtualBinary *running;
   Supla::Sensor::GeneralPurposeMeasurement *fault;
-  Supla::Sensor::GeneralPurposeMeasurement *firmware;
-  Supla::Sensor::GeneralPurposeMeasurement *counter;
-  Supla::Sensor::GeneralPurposeMeasurement *systemType;
   Supla::Sensor::GeneralPurposeMeasurement *defrost;
   Supla::Sensor::GeneralPurposeMeasurement *mode;
   Supla::Sensor::VirtualBinary *online;
@@ -171,9 +199,6 @@ enum RegisterType {
   REG_DEFROST,
   REG_OPERATING_MODE,
   REG_FAULT,
-  REG_FIRMWARE,
-  REG_COUNTER,
-  REG_SYSTEM_TYPE,
   REG_FLOW_SETPOINT,
   REG_SYSTEM_ON,
   REG_RUNTIME_HOURS,
@@ -210,9 +235,6 @@ ModbusPollItem pollItems[] = {
   {85,  5000, {0}, REG_FLOW_SETPOINT, ALL_PUMPS},
   {25,  5000, {0}, REG_SYSTEM_ON, ALL_PUMPS},
 
-  {10, 60000, {0}, REG_FIRMWARE, ALL_PUMPS},
-  {11, 60000, {0}, REG_COUNTER, ALL_PUMPS},
-  {13, 60000, {0}, REG_SYSTEM_TYPE, ALL_PUMPS},
   {136, 60000, {0}, REG_RUNTIME_HOURS, CAHV_PUMPS},
   {137, 60000, {0}, REG_RUNTIME_HUNDREDS, CAHV_PUMPS},
   {30, 60000, {0}, REG_THERMO_OFF, QAHV_PUMP}
@@ -244,11 +266,9 @@ struct PumpState {
   uint16_t defrost;
   uint16_t operatingMode;
   uint16_t fault;
-  uint16_t systemType;
   bool haveDefrost;
   bool haveOperatingMode;
   bool haveFault;
-  bool haveSystemType;
   uint16_t runtimeRemainder;
   uint16_t runtimeHundreds;
   bool haveRuntimeRemainder;
@@ -263,7 +283,6 @@ struct PumpState {
   int32_t lastDefrostDescription;
   int32_t lastOperatingDescription;
   int32_t lastFaultDescription;
-  int32_t lastSystemDescription;
 };
 
 PumpState pumpState[PUMP_COUNT] = {};
@@ -536,30 +555,6 @@ const char *getFaultText(
 }
 
 
-const char *getSystemTypeText(
-  uint16_t value
-) {
-
-  switch (value) {
-
-    case 0:
-      return "ATA";
-
-    case 1:
-      return "ATW";
-
-    case 2:
-      return "Lossnay";
-
-    case 255:
-      return "Unknown";
-
-    default:
-      return "Unknown";
-  }
-}
-
-
 // =====================================================
 // PRZETWARZANIE REJESTROW
 // =====================================================
@@ -726,48 +721,6 @@ void applyRegisterValue(
     }
 
 
-    // -----------------------------------------------
-    // Melco firmware
-    // addr 10
-    // -----------------------------------------------
-
-    case REG_FIRMWARE: {
-
-      channels.firmware->setValue(raw);
-
-      break;
-    }
-
-
-    // -----------------------------------------------
-    // Modbus counter
-    // addr 11
-    // -----------------------------------------------
-
-    case REG_COUNTER: {
-
-      channels.counter->setValue(raw);
-
-      break;
-    }
-
-
-    // -----------------------------------------------
-    // System type
-    // addr 13
-    // -----------------------------------------------
-
-    case REG_SYSTEM_TYPE: {
-
-      channels.systemType->setValue(raw);
-
-      state.systemType = raw;
-      state.haveSystemType = true;
-
-
-      break;
-    }
-
     case REG_FLOW_SETPOINT:
       channels.settingWater->setValue(((int16_t)raw) / 100.0);
       break;
@@ -907,8 +860,7 @@ void configureGpmHistory(bool notifyCloud) {
   for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
     PumpChannels &channels = pumpChannels[pump];
     Supla::Sensor::GeneralPurposeMeasurement *measurements[] = {
-      channels.frequency, channels.fault, channels.firmware,
-      channels.counter, channels.systemType, channels.defrost,
+      channels.frequency, channels.fault, channels.defrost,
       channels.mode, channels.systemOn, channels.runtimeHours,
       channels.temperatureDelta, channels.compressorStarts
     };
@@ -921,6 +873,14 @@ void configureGpmHistory(bool notifyCloud) {
       }
       enabled += measurement->getKeepHistory() == 1;
     }
+  }
+  if (cwuEnergy) {
+    total++;
+    if (cwuEnergy->getKeepHistory() != 1) {
+      cwuEnergy->setKeepHistory(1, notifyCloud);
+      changed = true;
+    }
+    enabled += cwuEnergy->getKeepHistory() == 1;
   }
   if (notifyCloud && (!historyConfigured || changed)) {
     Serial.print("SUPLA GPM KeepHistory local: ");
@@ -977,7 +937,6 @@ void updateStatusDescriptions() {
       state.lastDefrostDescription = -1;
       state.lastOperatingDescription = -1;
       state.lastFaultDescription = -1;
-      state.lastSystemDescription = -1;
     }
 
 
@@ -1023,11 +982,6 @@ void updateStatusDescriptions() {
         state.fault != state.lastFaultDescription) {
       channels.fault->setUnitAfterValue(getFaultText(state.fault));
       state.lastFaultDescription = state.fault;
-    }
-    if (state.haveSystemType &&
-        state.systemType != state.lastSystemDescription) {
-      channels.systemType->setUnitAfterValue(getSystemTypeText(state.systemType));
-      state.lastSystemDescription = state.systemType;
     }
   }
 }
@@ -1619,6 +1573,128 @@ void namePumpChannel(Supla::Element *element, uint8_t pump,
   element->setInitialCaption(caption.c_str());
 }
 
+void numberChannel(Supla::ChannelElement *element, uint8_t number) {
+  if (!element->getChannel()->setChannelNumber(number)) {
+    Serial.print("Nie mozna przypisac kanalu SUPLA nr ");
+    Serial.println(number);
+  }
+}
+
+void printDsBindings() {
+  for (uint8_t slot = 0; slot < DS_SENSOR_COUNT; slot++) {
+    if (!dsBound[slot]) continue;
+    Serial.print("DS18B20 czujnik ");
+    Serial.print(slot + 1);
+    Serial.print(" ROM: ");
+    for (uint8_t byteIndex = 0; byteIndex < 8; byteIndex++) {
+      if (dsAddress[slot][byteIndex] < 0x10) Serial.print('0');
+      Serial.print(dsAddress[slot][byteIndex], HEX);
+    }
+    Serial.println();
+  }
+}
+
+void discoverDsSensors() {
+  lastDsDiscovery = millis();
+  dsBus.begin();
+  dsBus.setWaitForConversion(false);
+  dsBus.setResolution(12);
+
+  Preferences preferences;
+  if (!preferences.begin("melco-1wire", false)) {
+    Serial.println("DS18B20: blad NVS, nowe czujniki nie beda przypisane");
+    return;
+  }
+
+  bool changed = false;
+  DeviceAddress foundAddress;
+  for (uint8_t index = 0; index < dsBus.getDeviceCount(); index++) {
+    if (!dsBus.getAddress(foundAddress, index) ||
+        foundAddress[0] != 0x28 ||
+        OneWire::crc8(foundAddress, 7) != foundAddress[7]) continue;
+
+    bool known = false;
+    for (uint8_t slot = 0; slot < DS_SENSOR_COUNT; slot++) {
+      if (dsBound[slot] && memcmp(dsAddress[slot], foundAddress, 8) == 0) {
+        known = true;
+        break;
+      }
+    }
+    if (known) continue;
+
+    for (uint8_t slot = 0; slot < DS_SENSOR_COUNT; slot++) {
+      if (dsBound[slot]) continue;
+      if (preferences.putBytes(DS_KEYS[slot], foundAddress, 8) == 8) {
+        memcpy(dsAddress[slot], foundAddress, 8);
+        dsBound[slot] = true;
+        changed = true;
+        Serial.print("DS18B20: przypisano nowy czujnik ");
+        Serial.println(slot + 1);
+      } else {
+        Serial.println("DS18B20: blad zapisu adresu do NVS");
+      }
+      break;
+    }
+  }
+  preferences.end();
+  if (changed) printDsBindings();
+}
+
+void initDsSensors() {
+  Preferences preferences;
+  if (preferences.begin("melco-1wire", true)) {
+    for (uint8_t slot = 0; slot < DS_SENSOR_COUNT; slot++) {
+      if (preferences.getBytesLength(DS_KEYS[slot]) == 8 &&
+          preferences.getBytes(DS_KEYS[slot], dsAddress[slot], 8) == 8 &&
+          dsAddress[slot][0] == 0x28 &&
+          OneWire::crc8(dsAddress[slot], 7) == dsAddress[slot][7]) {
+        dsBound[slot] = true;
+      }
+    }
+    preferences.end();
+  }
+  discoverDsSensors();
+  printDsBindings();
+}
+
+void handleDsSensors() {
+  unsigned long now = millis();
+  if (!dsConversionPending) {
+    if (now - lastDsDiscovery >= 60000) discoverDsSensors();
+    if (now - dsConversionStarted >= DS_READ_INTERVAL) {
+      dsBus.requestTemperatures();
+      dsConversionStarted = millis();
+      dsConversionPending = true;
+    }
+    return;
+  }
+  if (now - dsConversionStarted < DS_CONVERSION_TIME) return;
+
+  double totalKwh = 0;
+  bool complete = true;
+  for (uint8_t slot = 0; slot < DS_SENSOR_COUNT; slot++) {
+    double temperature = TEMPERATURE_NOT_AVAILABLE;
+    if (dsBound[slot]) {
+      temperature = dsBus.getTempC(dsAddress[slot]);
+      if (temperature == DEVICE_DISCONNECTED_C || temperature == 85.0 ||
+          temperature < -55.0 || temperature > 125.0) {
+        temperature = TEMPERATURE_NOT_AVAILABLE;
+      }
+    }
+    dsChannel[slot]->setValue(temperature);
+    if (slot < TANK_COUNT) {
+      if (temperature == TEMPERATURE_NOT_AVAILABLE) {
+        complete = false;
+      } else if (temperature > CWU_COLD_REFERENCE_C) {
+        totalKwh += TANK_VOLUME_LITERS *
+                    (temperature - CWU_COLD_REFERENCE_C) * 0.001163;
+      }
+    }
+  }
+  cwuEnergy->setValue(complete ? totalKwh : NAN);
+  dsConversionPending = false;
+}
+
 void createSuplaChannels() {
 
 
@@ -1695,53 +1771,12 @@ void createSuplaChannels() {
 
 
   // =================================================
-  // 6 - Firmware MelcoBEMS
-  // =================================================
-
-  firmwareA1M =
-    new Supla::Sensor::GeneralPurposeMeasurement();
-
-  namePumpChannel(firmwareA1M, 0, "Firmware A1M");
-
-  firmwareA1M->setDefaultValuePrecision(
-    0
-  );
-
-
-  // =================================================
-  // 7 - Licznik Modbus
-  // =================================================
-
-  modbusCounter =
-    new Supla::Sensor::GeneralPurposeMeasurement();
-
-  namePumpChannel(modbusCounter, 0, "Licznik Modbus");
-
-  modbusCounter->setDefaultValuePrecision(
-    0
-  );
-
-
-  // =================================================
-  // 8 - Typ systemu
-  // =================================================
-
-  systemType =
-    new Supla::Sensor::GeneralPurposeMeasurement();
-
-  namePumpChannel(systemType, 0, "Typ systemu");
-
-  systemType->setDefaultValuePrecision(
-    0
-  );
-
-
-  // =================================================
   // 9 - Aktualizacja OTA
   // =================================================
 
   otaTrigger =
     new Supla::Control::VirtualRelay();
+  numberChannel(otaTrigger, 9);
 
   otaTrigger->setInitialCaption(
     "Aktualizacja OTA"
@@ -1760,6 +1795,7 @@ void createSuplaChannels() {
 
   defrostStatus =
     new Supla::Sensor::GeneralPurposeMeasurement();
+  numberChannel(defrostStatus, 10);
 
   namePumpChannel(defrostStatus, 0, "Odszranianie");
 
@@ -1774,6 +1810,7 @@ void createSuplaChannels() {
 
   operatingMode =
     new Supla::Sensor::GeneralPurposeMeasurement();
+  numberChannel(operatingMode, 11);
 
   namePumpChannel(operatingMode, 0, "Tryb pracy");
 
@@ -1788,12 +1825,13 @@ void createSuplaChannels() {
 
   modbusStatus =
     new Supla::Sensor::VirtualBinary();
+  numberChannel(modbusStatus, 12);
 
   namePumpChannel(modbusStatus, 0, "Komunikacja Modbus");
 
   modbusStatus->clear();
 
-  // Kanaly 0-12 zachowuja typ i numer, zmieniaja tylko podpis na CAHV 1.
+  // Luki 6-8 sa celowe: nie zmieniamy numerow zachowanych kanalow.
   PumpChannels &first = pumpChannels[0];
   first.outdoor = outdoorTemp;
   first.outlet = flowTemp;
@@ -1801,62 +1839,63 @@ void createSuplaChannels() {
   first.frequency = hpFrequency;
   first.running = hpRunning;
   first.fault = faultCode;
-  first.firmware = firmwareA1M;
-  first.counter = modbusCounter;
-  first.systemType = systemType;
   first.defrost = defrostStatus;
   first.mode = operatingMode;
   first.online = modbusStatus;
 
   // 13-14: dodatkowe odczyty CAHV 1.
   first.settingWater = new Supla::Sensor::VirtualThermometer();
+  numberChannel(first.settingWater, 13);
   namePumpChannel(first.settingWater, 0, "Nastawa temperatury wylotu");
   first.systemOn = new Supla::Sensor::GeneralPurposeMeasurement();
+  numberChannel(first.systemOn, 14);
   namePumpChannel(first.systemOn, 0, "System ON/OFF");
   first.systemOn->setDefaultValuePrecision(0);
 
   // 15-28: CAHV 2, 29-42: QAHV. W obu zestawach identyczna kolejnosc.
   for (uint8_t pump = 1; pump < PUMP_COUNT; pump++) {
     PumpChannels &channels = pumpChannels[pump];
+    const uint8_t base = pump == 1 ? 15 : 29;
     channels.outdoor = new Supla::Sensor::VirtualThermometer();
+    numberChannel(channels.outdoor, base);
     namePumpChannel(channels.outdoor, pump, "Temperatura zewnetrzna");
     channels.outlet = new Supla::Sensor::VirtualThermometer();
+    numberChannel(channels.outlet, base + 1);
     namePumpChannel(channels.outlet, pump, "Wylot wody");
     channels.inlet = new Supla::Sensor::VirtualThermometer();
+    numberChannel(channels.inlet, base + 2);
     namePumpChannel(channels.inlet, pump, "Wlot wody");
 
     channels.frequency = new Supla::Sensor::GeneralPurposeMeasurement();
+    numberChannel(channels.frequency, base + 3);
     namePumpChannel(channels.frequency, pump, "Czestotliwosc HP");
     channels.frequency->setDefaultUnitAfterValue("Hz");
     channels.frequency->setDefaultValuePrecision(0);
     channels.running = new Supla::Sensor::VirtualBinary();
+    numberChannel(channels.running, base + 4);
     namePumpChannel(channels.running, pump, "Praca pompy");
 
     channels.fault = new Supla::Sensor::GeneralPurposeMeasurement();
+    numberChannel(channels.fault, base + 5);
     namePumpChannel(channels.fault, pump, "Kod bledu");
     channels.fault->setDefaultValuePrecision(0);
-    channels.firmware = new Supla::Sensor::GeneralPurposeMeasurement();
-    namePumpChannel(channels.firmware, pump, "Firmware A1M");
-    channels.firmware->setDefaultValuePrecision(0);
-    channels.counter = new Supla::Sensor::GeneralPurposeMeasurement();
-    namePumpChannel(channels.counter, pump, "Licznik Modbus");
-    channels.counter->setDefaultValuePrecision(0);
-    channels.systemType = new Supla::Sensor::GeneralPurposeMeasurement();
-    namePumpChannel(channels.systemType, pump, "Typ systemu");
-    channels.systemType->setDefaultValuePrecision(0);
-
     channels.defrost = new Supla::Sensor::GeneralPurposeMeasurement();
+    numberChannel(channels.defrost, base + 9);
     namePumpChannel(channels.defrost, pump, "Odszranianie");
     channels.defrost->setDefaultValuePrecision(0);
     channels.mode = new Supla::Sensor::GeneralPurposeMeasurement();
+    numberChannel(channels.mode, base + 10);
     namePumpChannel(channels.mode, pump, "Tryb pracy");
     channels.mode->setDefaultValuePrecision(0);
     channels.online = new Supla::Sensor::VirtualBinary();
+    numberChannel(channels.online, base + 11);
     namePumpChannel(channels.online, pump, "Komunikacja Modbus");
     channels.online->clear();
     channels.settingWater = new Supla::Sensor::VirtualThermometer();
+    numberChannel(channels.settingWater, base + 12);
     namePumpChannel(channels.settingWater, pump, "Nastawa temperatury wylotu");
     channels.systemOn = new Supla::Sensor::GeneralPurposeMeasurement();
+    numberChannel(channels.systemOn, base + 13);
     namePumpChannel(channels.systemOn, pump, "System ON/OFF");
     channels.systemOn->setDefaultValuePrecision(0);
   }
@@ -1865,25 +1904,54 @@ void createSuplaChannels() {
   for (uint8_t pump = 0; pump < 2; pump++) {
     PumpChannels &channels = pumpChannels[pump];
     channels.runtimeHours = new Supla::Sensor::GeneralPurposeMeasurement();
+    numberChannel(channels.runtimeHours, 43 + pump);
     namePumpChannel(channels.runtimeHours, pump, "Godziny pracy");
     channels.runtimeHours->setDefaultUnitAfterValue("h");
     channels.runtimeHours->setDefaultValuePrecision(0);
   }
   pumpChannels[2].thermoOff = new Supla::Sensor::VirtualThermometer();
+  numberChannel(pumpChannels[2].thermoOff, 45);
   namePumpChannel(pumpChannels[2].thermoOff, 2, "Temperatura Thermo-off");
 
   // 46-51: nowe kanaly na koncu, bez zmiany numerow istniejacych kanalow.
   for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
     PumpChannels &channels = pumpChannels[pump];
     channels.temperatureDelta = new Supla::Sensor::GeneralPurposeMeasurement();
+    numberChannel(channels.temperatureDelta, 46 + pump * 2);
     namePumpChannel(channels.temperatureDelta, pump, "Delta zasilanie-powrot");
     channels.temperatureDelta->setDefaultUnitAfterValue("\xC2\xB0" "C");
     channels.temperatureDelta->setDefaultValuePrecision(2);
 
     channels.compressorStarts = new Supla::Sensor::GeneralPurposeMeasurement();
+    numberChannel(channels.compressorStarts, 47 + pump * 2);
     namePumpChannel(channels.compressorStarts, pump,
                     "Zaobserwowane starty sprezarki");
     channels.compressorStarts->setDefaultValuePrecision(0);
+  }
+
+  // 52-59: osiem czujnikow temperatury na wspolnej magistrali 1-Wire.
+  for (uint8_t slot = 0; slot < DS_SENSOR_COUNT; slot++) {
+    dsChannel[slot] = new Supla::Sensor::VirtualThermometer();
+    numberChannel(dsChannel[slot], 52 + slot);
+    dsChannel[slot]->setInitialCaption(DS_CAPTIONS[slot]);
+  }
+
+  // 60: energia cieplna powyzej 10 C, wyliczona z pieciu zbiornikow.
+  cwuEnergy = new Supla::Sensor::GeneralPurposeMeasurement();
+  numberChannel(cwuEnergy, 60);
+  cwuEnergy->setInitialCaption("CWU - szacowana energia 5 zbiornikow");
+  cwuEnergy->setDefaultUnitAfterValue("kWh");
+  cwuEnergy->setDefaultValuePrecision(1);
+  cwuEnergy->setValue(NAN);
+
+  // 61-65: tylko sterowanie reczne. Automatyka kotla zostanie dodana pozniej.
+  for (uint8_t relay = 0; relay < RELAY_COUNT; relay++) {
+    physicalRelay[relay] = new Supla::Control::Relay(
+      RELAY_PINS[relay], true, SUPLA_BIT_FUNC_POWERSWITCH);
+    numberChannel(physicalRelay[relay], 61 + relay);
+    physicalRelay[relay]->setInitialCaption(RELAY_CAPTIONS[relay]);
+    physicalRelay[relay]->setDefaultFunction(SUPLA_CHANNELFNC_POWERSWITCH);
+    physicalRelay[relay]->setDefaultStateOff();
   }
 }
 
@@ -1893,6 +1961,11 @@ void createSuplaChannels() {
 // =====================================================
 
 void setup() {
+
+  for (uint8_t relay = 0; relay < RELAY_COUNT; relay++) {
+    digitalWrite(RELAY_PINS[relay], LOW);
+    pinMode(RELAY_PINS[relay], OUTPUT);
+  }
 
   Serial.begin(
     115200
@@ -1968,6 +2041,7 @@ void setup() {
   createSuplaChannels();
   configureGpmHistory(false);
   loadCompressorStartCounts();
+  initDsSensors();
 
   for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
     pumpState[pump].nextProbe = millis() + 1500;
@@ -2080,5 +2154,6 @@ void loop() {
   // MODBUS
   // =================================================
 
+  handleDsSensors();
   handleModbusScheduler();
 }
