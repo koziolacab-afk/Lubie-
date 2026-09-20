@@ -31,7 +31,7 @@
 // WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.11"
+#define FW_VERSION "1.0.12"
 
 
 // =====================================================
@@ -42,6 +42,7 @@ const char *OTA_URL =
   "https://github.com/koziolacab-afk/Lubie-/releases/download/ota/firmware.bin";
 
 const unsigned long OTA_VERIFY_DELAY = 60000;
+const unsigned long OTA_ROLLBACK_TIMEOUT = 180000;
 
 bool otaInProgress = false;
 bool otaPendingVerification = false;
@@ -153,6 +154,11 @@ Supla::Sensor::VirtualBinary *hpRunning;
 // 5
 Supla::Sensor::GeneralPurposeMeasurement *faultCode;
 
+// 6-8: zachowane kanaly SUPLA, bez odpytywania Modbus.
+Supla::Sensor::GeneralPurposeMeasurement *firmwareA1M;
+Supla::Sensor::GeneralPurposeMeasurement *modbusCounter;
+Supla::Sensor::GeneralPurposeMeasurement *systemType;
+
 // 9
 Supla::Control::VirtualRelay *otaTrigger;
 
@@ -172,6 +178,9 @@ struct PumpChannels {
   Supla::Sensor::GeneralPurposeMeasurement *frequency;
   Supla::Sensor::VirtualBinary *running;
   Supla::Sensor::GeneralPurposeMeasurement *fault;
+  Supla::Sensor::GeneralPurposeMeasurement *firmware;
+  Supla::Sensor::GeneralPurposeMeasurement *counter;
+  Supla::Sensor::GeneralPurposeMeasurement *systemType;
   Supla::Sensor::GeneralPurposeMeasurement *defrost;
   Supla::Sensor::GeneralPurposeMeasurement *mode;
   Supla::Sensor::VirtualBinary *online;
@@ -1054,7 +1063,7 @@ void initRollbackState() {
       );
 
       Serial.println(
-        "Test firmware: 60 s"
+        "Test firmware: 60 s, rollback po 180 s bez SUPLA"
       );
 
       Serial.println(
@@ -1145,6 +1154,14 @@ void handleRollbackVerification() {
     "OK" :
     "BRAK"
   );
+
+  if (!suplaOK && now - otaVerifyStart >= OTA_ROLLBACK_TIMEOUT) {
+    Serial.println("OTA: brak polaczenia z SUPLA, przywracam poprzedni firmware");
+    esp_err_t result = esp_ota_mark_app_invalid_rollback_and_reboot();
+    Serial.print("OTA ROLLBACK ERROR: ");
+    Serial.println(esp_err_to_name(result));
+    return;
+  }
 
 
   if (
@@ -1438,6 +1455,9 @@ const char *getSuplaStatusText(
 
     case STATUS_REGISTERED_AND_READY:
       return "READY";
+
+    case STATUS_CHANNEL_CONFLICT:
+      return "CHANNEL CONFLICT";
 
     case STATUS_BAD_CREDENTIALS:
       return "BAD CREDENTIALS";
@@ -1769,6 +1789,22 @@ void createSuplaChannels() {
     0
   );
 
+  // Zachowujemy stare numery i typy, aby Cloud nie odrzucil rejestracji.
+  firmwareA1M = new Supla::Sensor::GeneralPurposeMeasurement();
+  numberChannel(firmwareA1M, 6);
+  namePumpChannel(firmwareA1M, 0, "Firmware A1M");
+  firmwareA1M->setDefaultValuePrecision(0);
+
+  modbusCounter = new Supla::Sensor::GeneralPurposeMeasurement();
+  numberChannel(modbusCounter, 7);
+  namePumpChannel(modbusCounter, 0, "Licznik Modbus");
+  modbusCounter->setDefaultValuePrecision(0);
+
+  systemType = new Supla::Sensor::GeneralPurposeMeasurement();
+  numberChannel(systemType, 8);
+  namePumpChannel(systemType, 0, "Typ systemu");
+  systemType->setDefaultValuePrecision(0);
+
 
   // =================================================
   // 9 - Aktualizacja OTA
@@ -1831,7 +1867,6 @@ void createSuplaChannels() {
 
   modbusStatus->clear();
 
-  // Luki 6-8 sa celowe: nie zmieniamy numerow zachowanych kanalow.
   PumpChannels &first = pumpChannels[0];
   first.outdoor = outdoorTemp;
   first.outlet = flowTemp;
@@ -1839,6 +1874,9 @@ void createSuplaChannels() {
   first.frequency = hpFrequency;
   first.running = hpRunning;
   first.fault = faultCode;
+  first.firmware = firmwareA1M;
+  first.counter = modbusCounter;
+  first.systemType = systemType;
   first.defrost = defrostStatus;
   first.mode = operatingMode;
   first.online = modbusStatus;
@@ -1879,6 +1917,18 @@ void createSuplaChannels() {
     numberChannel(channels.fault, base + 5);
     namePumpChannel(channels.fault, pump, "Kod bledu");
     channels.fault->setDefaultValuePrecision(0);
+    channels.firmware = new Supla::Sensor::GeneralPurposeMeasurement();
+    numberChannel(channels.firmware, base + 6);
+    namePumpChannel(channels.firmware, pump, "Firmware A1M");
+    channels.firmware->setDefaultValuePrecision(0);
+    channels.counter = new Supla::Sensor::GeneralPurposeMeasurement();
+    numberChannel(channels.counter, base + 7);
+    namePumpChannel(channels.counter, pump, "Licznik Modbus");
+    channels.counter->setDefaultValuePrecision(0);
+    channels.systemType = new Supla::Sensor::GeneralPurposeMeasurement();
+    numberChannel(channels.systemType, base + 8);
+    namePumpChannel(channels.systemType, pump, "Typ systemu");
+    channels.systemType->setDefaultValuePrecision(0);
     channels.defrost = new Supla::Sensor::GeneralPurposeMeasurement();
     numberChannel(channels.defrost, base + 9);
     namePumpChannel(channels.defrost, pump, "Odszranianie");
@@ -2065,6 +2115,8 @@ void setup() {
   SuplaDevice.setInitialMode(
     Supla::InitialMode::StartInCfgMode
   );
+
+  SuplaDevice.setProtoVerboseLog(false);
 
 
   // =================================================
