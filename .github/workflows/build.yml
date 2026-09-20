@@ -41,7 +41,7 @@ jobs:
           mkdir -p build
 
           arduino-cli compile \
-            --fqbn "esp32:esp32:esp32s3:FlashSize=4M,PartitionScheme=default,CDCOnBoot=cdc,USBMode=hwcdc,PSRAM=opi" \
+            --fqbn "esp32:esp32:esp32s3:FlashSize=8M,PartitionScheme=default_8MB,CDCOnBoot=cdc,USBMode=hwcdc,PSRAM=disabled" \
             --output-dir build \
             MelcoBEMS_SUPLA
 
@@ -49,7 +49,7 @@ jobs:
         run: |
           cp build/*.ino.bin build/firmware.bin
           size=$(stat -c%s build/firmware.bin)
-          max_size=$((0x140000))
+          max_size=$((0x330000))
           if [ "$size" -gt "$max_size" ]; then
             echo "::error::firmware.bin (${size} B) exceeds OTA slot (${max_size} B)"
             exit 1

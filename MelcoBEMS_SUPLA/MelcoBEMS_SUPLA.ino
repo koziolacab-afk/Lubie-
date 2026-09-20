@@ -26,7 +26,7 @@
 // WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.3"
+#define FW_VERSION "1.0.5"
 
 
 // =====================================================
@@ -1557,6 +1557,11 @@ void performOTA() {
     result ==
     HTTP_UPDATE_FAILED
   ) {
+
+    Serial.print("OTA ERROR: ");
+    Serial.println(httpUpdate.getLastError());
+    Serial.print("Opis: ");
+    Serial.println(httpUpdate.getLastErrorString());
 
     Serial.println(
       "OTA zakonczone bledem"
