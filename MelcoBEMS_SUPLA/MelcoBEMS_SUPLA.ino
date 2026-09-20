@@ -26,7 +26,7 @@
 // WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.6"
+#define FW_VERSION "1.0.7"
 
 
 // =====================================================
@@ -146,6 +146,8 @@ struct PumpChannels {
   Supla::Sensor::VirtualBinary *online;
   Supla::Sensor::VirtualThermometer *settingWater;
   Supla::Sensor::GeneralPurposeMeasurement *systemOn;
+  Supla::Sensor::GeneralPurposeMeasurement *runtimeHours;
+  Supla::Sensor::VirtualThermometer *thermoOff;
 };
 
 PumpChannels pumpChannels[PUMP_COUNT] = {};
@@ -168,7 +170,10 @@ enum RegisterType {
   REG_COUNTER,
   REG_SYSTEM_TYPE,
   REG_SETTING_WATER,
-  REG_SYSTEM_ON
+  REG_SYSTEM_ON,
+  REG_RUNTIME_HOURS,
+  REG_RUNTIME_HUNDREDS,
+  REG_THERMO_OFF
 };
 
 void applyRegisterValue(uint8_t pump, uint8_t type, uint16_t raw);
@@ -178,27 +183,34 @@ struct ModbusPollItem {
   unsigned long interval;
   unsigned long lastPoll[PUMP_COUNT];
   RegisterType type;
+  uint8_t pumpMask;
 };
 
+const uint8_t ALL_PUMPS = 0x07;
+const uint8_t CAHV_PUMPS = 0x03;
+const uint8_t QAHV_PUMP = 0x04;
 
-// Rejestry dynamiczne: 5 s
-// Rejestry diagnostyczne: 60 s
+// Adresy sa wspolne, ale kazdy wpis ma jawna maske modeli i osobny czas
+// ostatniego odczytu dla slave 1 (CAHV 1), 2 (CAHV 2) i 3 (QAHV).
 ModbusPollItem pollItems[] = {
 
-  {99,  5000, {0}, REG_OUTDOOR},
-  {101, 5000, {0}, REG_FLOW},
-  {103, 5000, {0}, REG_RETURN},
-  {73,  5000, {0}, REG_FREQUENCY},
-  {127, 5000, {0}, REG_HP_RUNNING},
-  {67,  5000, {0}, REG_DEFROST},
-  {26,  5000, {0}, REG_OPERATING_MODE},
-  {9,   5000, {0}, REG_FAULT},
-  {52,  5000, {0}, REG_SETTING_WATER},
-  {25,  5000, {0}, REG_SYSTEM_ON},
+  {99,  5000, {0}, REG_OUTDOOR, ALL_PUMPS},
+  {101, 5000, {0}, REG_FLOW, ALL_PUMPS},
+  {103, 5000, {0}, REG_RETURN, ALL_PUMPS},
+  {73,  5000, {0}, REG_FREQUENCY, ALL_PUMPS},
+  {127, 5000, {0}, REG_HP_RUNNING, ALL_PUMPS},
+  {67,  5000, {0}, REG_DEFROST, ALL_PUMPS},
+  {26,  5000, {0}, REG_OPERATING_MODE, ALL_PUMPS},
+  {9,   5000, {0}, REG_FAULT, ALL_PUMPS},
+  {52,  5000, {0}, REG_SETTING_WATER, ALL_PUMPS},
+  {25,  5000, {0}, REG_SYSTEM_ON, ALL_PUMPS},
 
-  {10, 60000, {0}, REG_FIRMWARE},
-  {11, 60000, {0}, REG_COUNTER},
-  {13, 60000, {0}, REG_SYSTEM_TYPE}
+  {10, 60000, {0}, REG_FIRMWARE, ALL_PUMPS},
+  {11, 60000, {0}, REG_COUNTER, ALL_PUMPS},
+  {13, 60000, {0}, REG_SYSTEM_TYPE, ALL_PUMPS},
+  {136, 60000, {0}, REG_RUNTIME_HOURS, CAHV_PUMPS},
+  {137, 60000, {0}, REG_RUNTIME_HUNDREDS, CAHV_PUMPS},
+  {30, 60000, {0}, REG_THERMO_OFF, QAHV_PUMP}
 };
 
 
@@ -232,6 +244,10 @@ struct PumpState {
   bool haveOperatingMode;
   bool haveFault;
   bool haveSystemType;
+  uint16_t runtimeRemainder;
+  uint16_t runtimeHundreds;
+  bool haveRuntimeRemainder;
+  bool haveRuntimeHundreds;
   int32_t lastDefrostDescription;
   int32_t lastOperatingDescription;
   int32_t lastFaultDescription;
@@ -251,6 +267,7 @@ PumpState pumpState[PUMP_COUNT] = {};
 
 bool suplaWasReady = false;
 bool historyConfigured = false;
+unsigned long lastHistoryCheck = 0;
 
 unsigned long suplaReadySince = 0;
 
@@ -784,6 +801,31 @@ void applyRegisterValue(
       Serial.print("System on/off: ");
       Serial.println(raw);
       break;
+
+    case REG_RUNTIME_HOURS:
+      state.runtimeRemainder = raw;
+      state.haveRuntimeRemainder = true;
+      break;
+
+    case REG_RUNTIME_HUNDREDS:
+      state.runtimeHundreds = raw;
+      state.haveRuntimeHundreds = true;
+      break;
+
+    case REG_THERMO_OFF:
+      channels.thermoOff->setValue(((int16_t)raw) / 100.0);
+      Serial.print("Thermo-off: ");
+      Serial.println(((int16_t)raw) / 100.0);
+      break;
+  }
+
+  if (channels.runtimeHours &&
+      (type == REG_RUNTIME_HOURS || type == REG_RUNTIME_HUNDREDS) &&
+      state.haveRuntimeRemainder &&
+      state.haveRuntimeHundreds) {
+    uint32_t hours = (uint32_t)state.runtimeHundreds * 100U +
+                     state.runtimeRemainder;
+    channels.runtimeHours->setValue(hours);
   }
 }
 
@@ -845,6 +887,7 @@ void handleModbusScheduler() {
     for (uint8_t i = 0; i < POLL_ITEM_COUNT; i++) {
       uint8_t index = (pollCursor[pump] + i) % POLL_ITEM_COUNT;
       ModbusPollItem &item = pollItems[index];
+      if (!(item.pumpMask & (1U << pump))) continue;
       if (now - item.lastPoll[pump] < item.interval) continue;
 
       pollCursor[pump] = (index + 1) % POLL_ITEM_COUNT;
@@ -881,23 +924,21 @@ void handleModbusScheduler() {
 // =====================================================
 
 void configureGpmHistory() {
+  bool changed = false;
   for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
     PumpChannels &channels = pumpChannels[pump];
-    if (channels.frequency->getKeepHistory() != 1)
-      channels.frequency->setKeepHistory(1);
-    if (channels.fault->getKeepHistory() != 1)
-      channels.fault->setKeepHistory(1);
-    if (channels.defrost->getKeepHistory() != 1)
-      channels.defrost->setKeepHistory(1);
-    if (channels.mode->getKeepHistory() != 1)
-      channels.mode->setKeepHistory(1);
+    Supla::Sensor::GeneralPurposeMeasurement *measurements[] = {
+      channels.frequency, channels.fault, channels.defrost,
+      channels.mode, channels.systemOn, channels.runtimeHours
+    };
+    for (auto *measurement : measurements) {
+      if (measurement && measurement->getKeepHistory() != 1) {
+        measurement->setKeepHistory(1);
+        changed = true;
+      }
+    }
   }
-  historyConfigured = true;
-
-
-  Serial.println(
-    "SUPLA: historia GPM wlaczona"
-  );
+  if (changed) Serial.println("SUPLA: wlaczono historie pomiarow GPM");
 }
 
 
@@ -925,6 +966,7 @@ void updateStatusDescriptions() {
 
     suplaWasReady = false;
     suplaReadySince = 0;
+    historyConfigured = false;
 
     return;
   }
@@ -933,6 +975,7 @@ void updateStatusDescriptions() {
   if (!suplaWasReady) {
 
     suplaWasReady = true;
+    historyConfigured = false;
 
     suplaReadySince =
       millis();
@@ -967,9 +1010,10 @@ void updateStatusDescriptions() {
 
   // Historia ustawiana po synchronizacji
   // konfiguracji z Cloud.
-  if (!historyConfigured) {
-
+  if (!historyConfigured || millis() - lastHistoryCheck >= 60000) {
     configureGpmHistory();
+    historyConfigured = true;
+    lastHistoryCheck = millis();
   }
 
 
@@ -1596,9 +1640,7 @@ void createSuplaChannels() {
   outdoorTemp =
     new Supla::Sensor::VirtualThermometer();
 
-  outdoorTemp->setInitialCaption(
-    "Temperatura zewnetrzna"
-  );
+  namePumpChannel(outdoorTemp, 0, "Temperatura zewnetrzna");
 
 
   // =================================================
@@ -1608,9 +1650,7 @@ void createSuplaChannels() {
   flowTemp =
     new Supla::Sensor::VirtualThermometer();
 
-  flowTemp->setInitialCaption(
-    "Temperatura zasilania"
-  );
+  namePumpChannel(flowTemp, 0, "Wylot wody");
 
 
   // =================================================
@@ -1620,9 +1660,7 @@ void createSuplaChannels() {
   returnTemp =
     new Supla::Sensor::VirtualThermometer();
 
-  returnTemp->setInitialCaption(
-    "Temperatura powrotu"
-  );
+  namePumpChannel(returnTemp, 0, "Wlot wody");
 
 
   // =================================================
@@ -1632,9 +1670,7 @@ void createSuplaChannels() {
   hpFrequency =
     new Supla::Sensor::GeneralPurposeMeasurement();
 
-  hpFrequency->setInitialCaption(
-    "Czestotliwosc HP"
-  );
+  namePumpChannel(hpFrequency, 0, "Czestotliwosc HP");
 
   hpFrequency->setDefaultUnitAfterValue(
     "Hz"
@@ -1652,9 +1688,7 @@ void createSuplaChannels() {
   hpRunning =
     new Supla::Sensor::VirtualBinary();
 
-  hpRunning->setInitialCaption(
-    "Praca pompy ciepla"
-  );
+  namePumpChannel(hpRunning, 0, "Praca pompy");
 
 
   // =================================================
@@ -1664,9 +1698,7 @@ void createSuplaChannels() {
   faultCode =
     new Supla::Sensor::GeneralPurposeMeasurement();
 
-  faultCode->setInitialCaption(
-    "Kod bledu"
-  );
+  namePumpChannel(faultCode, 0, "Kod bledu");
 
   faultCode->setDefaultValuePrecision(
     0
@@ -1680,9 +1712,7 @@ void createSuplaChannels() {
   firmwareA1M =
     new Supla::Sensor::GeneralPurposeMeasurement();
 
-  firmwareA1M->setInitialCaption(
-    "Firmware MelcoBEMS"
-  );
+  namePumpChannel(firmwareA1M, 0, "Firmware A1M");
 
   firmwareA1M->setDefaultValuePrecision(
     0
@@ -1696,9 +1726,7 @@ void createSuplaChannels() {
   modbusCounter =
     new Supla::Sensor::GeneralPurposeMeasurement();
 
-  modbusCounter->setInitialCaption(
-    "Licznik Modbus"
-  );
+  namePumpChannel(modbusCounter, 0, "Licznik Modbus");
 
   modbusCounter->setDefaultValuePrecision(
     0
@@ -1712,9 +1740,7 @@ void createSuplaChannels() {
   systemType =
     new Supla::Sensor::GeneralPurposeMeasurement();
 
-  systemType->setInitialCaption(
-    "Typ systemu"
-  );
+  namePumpChannel(systemType, 0, "Typ systemu");
 
   systemType->setDefaultValuePrecision(
     0
@@ -1746,9 +1772,7 @@ void createSuplaChannels() {
   defrostStatus =
     new Supla::Sensor::GeneralPurposeMeasurement();
 
-  defrostStatus->setInitialCaption(
-    "Odszranianie"
-  );
+  namePumpChannel(defrostStatus, 0, "Odszranianie");
 
   defrostStatus->setDefaultValuePrecision(
     0
@@ -1762,9 +1786,7 @@ void createSuplaChannels() {
   operatingMode =
     new Supla::Sensor::GeneralPurposeMeasurement();
 
-  operatingMode->setInitialCaption(
-    "Tryb pracy"
-  );
+  namePumpChannel(operatingMode, 0, "Tryb pracy");
 
   operatingMode->setDefaultValuePrecision(
     0
@@ -1778,9 +1800,7 @@ void createSuplaChannels() {
   modbusStatus =
     new Supla::Sensor::VirtualBinary();
 
-  modbusStatus->setInitialCaption(
-    "Komunikacja Modbus"
-  );
+  namePumpChannel(modbusStatus, 0, "Komunikacja Modbus");
 
   modbusStatus->clear();
 
@@ -1798,19 +1818,6 @@ void createSuplaChannels() {
   first.defrost = defrostStatus;
   first.mode = operatingMode;
   first.online = modbusStatus;
-
-  namePumpChannel(first.outdoor, 0, "Temperatura zewnetrzna");
-  namePumpChannel(first.outlet, 0, "Wylot wody");
-  namePumpChannel(first.inlet, 0, "Wlot wody");
-  namePumpChannel(first.frequency, 0, "Czestotliwosc HP");
-  namePumpChannel(first.running, 0, "Praca pompy");
-  namePumpChannel(first.fault, 0, "Kod bledu");
-  namePumpChannel(first.firmware, 0, "Firmware A1M");
-  namePumpChannel(first.counter, 0, "Licznik Modbus");
-  namePumpChannel(first.systemType, 0, "Typ systemu");
-  namePumpChannel(first.defrost, 0, "Odszranianie");
-  namePumpChannel(first.mode, 0, "Tryb pracy");
-  namePumpChannel(first.online, 0, "Komunikacja Modbus");
 
   // 13-14: dodatkowe odczyty CAHV 1.
   first.settingWater = new Supla::Sensor::VirtualThermometer();
@@ -1864,6 +1871,17 @@ void createSuplaChannels() {
     namePumpChannel(channels.systemOn, pump, "System ON/OFF");
     channels.systemOn->setDefaultValuePrecision(0);
   }
+
+  // Kanaly 43-45 dopisane na koncu, aby zachowac identyfikatory 0-42.
+  for (uint8_t pump = 0; pump < 2; pump++) {
+    PumpChannels &channels = pumpChannels[pump];
+    channels.runtimeHours = new Supla::Sensor::GeneralPurposeMeasurement();
+    namePumpChannel(channels.runtimeHours, pump, "Godziny pracy");
+    channels.runtimeHours->setDefaultUnitAfterValue("h");
+    channels.runtimeHours->setDefaultValuePrecision(0);
+  }
+  pumpChannels[2].thermoOff = new Supla::Sensor::VirtualThermometer();
+  namePumpChannel(pumpChannels[2].thermoOff, 2, "Temperatura Thermo-off");
 }
 
 
