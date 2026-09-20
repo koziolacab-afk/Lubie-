@@ -17,6 +17,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPUpdate.h>
+#include <Preferences.h>
 
 #include "esp_ota_ops.h"
 #include "esp_err.h"
@@ -26,7 +27,7 @@
 // WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.9"
+#define FW_VERSION "1.0.10"
 
 
 // =====================================================
@@ -150,6 +151,8 @@ struct PumpChannels {
   Supla::Sensor::GeneralPurposeMeasurement *systemOn;
   Supla::Sensor::GeneralPurposeMeasurement *runtimeHours;
   Supla::Sensor::VirtualThermometer *thermoOff;
+  Supla::Sensor::GeneralPurposeMeasurement *temperatureDelta;
+  Supla::Sensor::GeneralPurposeMeasurement *compressorStarts;
 };
 
 PumpChannels pumpChannels[PUMP_COUNT] = {};
@@ -250,6 +253,13 @@ struct PumpState {
   uint16_t runtimeHundreds;
   bool haveRuntimeRemainder;
   bool haveRuntimeHundreds;
+  int16_t flowRaw;
+  int16_t returnRaw;
+  bool haveFlow;
+  bool haveReturn;
+  bool frequencyKnown;
+  bool compressorRunning;
+  uint32_t compressorStarts;
   int32_t lastDefrostDescription;
   int32_t lastOperatingDescription;
   int32_t lastFaultDescription;
@@ -257,6 +267,36 @@ struct PumpState {
 };
 
 PumpState pumpState[PUMP_COUNT] = {};
+
+const char *const START_COUNT_KEYS[PUMP_COUNT] = {"s1", "s2", "s3"};
+
+void loadCompressorStartCounts() {
+  Preferences preferences;
+  if (!preferences.begin("melco-starts", true)) {
+    Serial.println("Nie mozna odczytac licznikow startow z NVS");
+    return;
+  }
+  for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
+    pumpState[pump].compressorStarts =
+      preferences.getUInt(START_COUNT_KEYS[pump], 0);
+    pumpChannels[pump].compressorStarts->setValue(
+      pumpState[pump].compressorStarts);
+  }
+  preferences.end();
+}
+
+void saveCompressorStartCount(uint8_t pump) {
+  Preferences preferences;
+  if (!preferences.begin("melco-starts", false)) {
+    Serial.println("Nie mozna zapisac licznika startow do NVS");
+    return;
+  }
+  if (preferences.putUInt(START_COUNT_KEYS[pump],
+                          pumpState[pump].compressorStarts) != sizeof(uint32_t)) {
+    Serial.println("Blad zapisu licznika startow do NVS");
+  }
+  preferences.end();
+}
 
 
 // =====================================================
@@ -364,6 +404,12 @@ void setModbusOnline(uint8_t pump, bool online) {
 
   state.stateKnown = true;
   state.online = online;
+
+  if (!online) {
+    state.haveFlow = false;
+    state.haveReturn = false;
+    state.frequencyKnown = false;
+  }
 
 
   if (online) {
@@ -555,8 +601,9 @@ void applyRegisterValue(
 
     case REG_FLOW: {
 
-      double value =
-        ((int16_t)raw) / 100.0;
+      state.flowRaw = (int16_t)raw;
+      state.haveFlow = true;
+      double value = state.flowRaw / 100.0;
 
       channels.outlet->setValue(value);
 
@@ -572,8 +619,9 @@ void applyRegisterValue(
 
     case REG_RETURN: {
 
-      double value =
-        ((int16_t)raw) / 100.0;
+      state.returnRaw = (int16_t)raw;
+      state.haveReturn = true;
+      double value = state.returnRaw / 100.0;
 
       channels.inlet->setValue(value);
 
@@ -589,6 +637,18 @@ void applyRegisterValue(
     case REG_FREQUENCY: {
 
       channels.frequency->setValue(raw);
+
+      if (raw <= 255) {
+        bool running = raw > 0;
+        if (state.frequencyKnown && !state.compressorRunning && running &&
+            state.compressorStarts < UINT32_MAX) {
+          state.compressorStarts++;
+          channels.compressorStarts->setValue(state.compressorStarts);
+          saveCompressorStartCount(pump);
+        }
+        state.compressorRunning = running;
+        state.frequencyKnown = true;
+      }
 
       break;
     }
@@ -731,6 +791,12 @@ void applyRegisterValue(
       break;
   }
 
+  if ((type == REG_FLOW || type == REG_RETURN) &&
+      state.haveFlow && state.haveReturn) {
+    int32_t deltaRaw = (int32_t)state.flowRaw - state.returnRaw;
+    channels.temperatureDelta->setValue(deltaRaw / 100.0);
+  }
+
   if (channels.runtimeHours &&
       (type == REG_RUNTIME_HOURS || type == REG_RUNTIME_HUNDREDS) &&
       state.haveRuntimeRemainder &&
@@ -843,7 +909,8 @@ void configureGpmHistory(bool notifyCloud) {
     Supla::Sensor::GeneralPurposeMeasurement *measurements[] = {
       channels.frequency, channels.fault, channels.firmware,
       channels.counter, channels.systemType, channels.defrost,
-      channels.mode, channels.systemOn, channels.runtimeHours
+      channels.mode, channels.systemOn, channels.runtimeHours,
+      channels.temperatureDelta, channels.compressorStarts
     };
     for (auto *measurement : measurements) {
       if (!measurement) continue;
@@ -1804,6 +1871,20 @@ void createSuplaChannels() {
   }
   pumpChannels[2].thermoOff = new Supla::Sensor::VirtualThermometer();
   namePumpChannel(pumpChannels[2].thermoOff, 2, "Temperatura Thermo-off");
+
+  // 46-51: nowe kanaly na koncu, bez zmiany numerow istniejacych kanalow.
+  for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
+    PumpChannels &channels = pumpChannels[pump];
+    channels.temperatureDelta = new Supla::Sensor::GeneralPurposeMeasurement();
+    namePumpChannel(channels.temperatureDelta, pump, "Delta zasilanie-powrot");
+    channels.temperatureDelta->setDefaultUnitAfterValue("\xC2\xB0" "C");
+    channels.temperatureDelta->setDefaultValuePrecision(2);
+
+    channels.compressorStarts = new Supla::Sensor::GeneralPurposeMeasurement();
+    namePumpChannel(channels.compressorStarts, pump,
+                    "Zaobserwowane starty sprezarki");
+    channels.compressorStarts->setDefaultValuePrecision(0);
+  }
 }
 
 
@@ -1886,6 +1967,7 @@ void setup() {
 
   createSuplaChannels();
   configureGpmHistory(false);
+  loadCompressorStartCounts();
 
   for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
     pumpState[pump].nextProbe = millis() + 1500;
