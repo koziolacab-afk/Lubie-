@@ -26,7 +26,7 @@
 // WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.5"
+#define FW_VERSION "1.0.6"
 
 
 // =====================================================
@@ -69,8 +69,11 @@ extern "C" bool verifyRollbackLater() {
 #define RS485_TX 17
 #define RS485_RX 18
 
-#define MODBUS_SLAVE_ID 1
 #define MODBUS_BAUD 9600
+
+const uint8_t PUMP_COUNT = 3;
+const uint8_t PUMP_SLAVE_IDS[PUMP_COUNT] = {1, 2, 3};
+const char *const PUMP_NAMES[PUMP_COUNT] = {"CAHV 1", "CAHV 2", "QAHV"};
 
 HardwareSerial RS485(1);
 ModbusMaster node;
@@ -128,6 +131,25 @@ Supla::Sensor::GeneralPurposeMeasurement *operatingMode;
 // 12
 Supla::Sensor::VirtualBinary *modbusStatus;
 
+struct PumpChannels {
+  Supla::Sensor::VirtualThermometer *outdoor;
+  Supla::Sensor::VirtualThermometer *outlet;
+  Supla::Sensor::VirtualThermometer *inlet;
+  Supla::Sensor::GeneralPurposeMeasurement *frequency;
+  Supla::Sensor::VirtualBinary *running;
+  Supla::Sensor::GeneralPurposeMeasurement *fault;
+  Supla::Sensor::GeneralPurposeMeasurement *firmware;
+  Supla::Sensor::GeneralPurposeMeasurement *counter;
+  Supla::Sensor::GeneralPurposeMeasurement *systemType;
+  Supla::Sensor::GeneralPurposeMeasurement *defrost;
+  Supla::Sensor::GeneralPurposeMeasurement *mode;
+  Supla::Sensor::VirtualBinary *online;
+  Supla::Sensor::VirtualThermometer *settingWater;
+  Supla::Sensor::GeneralPurposeMeasurement *systemOn;
+};
+
+PumpChannels pumpChannels[PUMP_COUNT] = {};
+
 
 // =====================================================
 // MODBUS - SCHEDULER
@@ -144,15 +166,17 @@ enum RegisterType {
   REG_FAULT,
   REG_FIRMWARE,
   REG_COUNTER,
-  REG_SYSTEM_TYPE
+  REG_SYSTEM_TYPE,
+  REG_SETTING_WATER,
+  REG_SYSTEM_ON
 };
 
-void applyRegisterValue(uint8_t type, uint16_t raw);
+void applyRegisterValue(uint8_t pump, uint8_t type, uint16_t raw);
 
 struct ModbusPollItem {
   uint16_t address;
   unsigned long interval;
-  unsigned long lastPoll;
+  unsigned long lastPoll[PUMP_COUNT];
   RegisterType type;
 };
 
@@ -161,18 +185,20 @@ struct ModbusPollItem {
 // Rejestry diagnostyczne: 60 s
 ModbusPollItem pollItems[] = {
 
-  {99,  5000, 0, REG_OUTDOOR},
-  {101, 5000, 0, REG_FLOW},
-  {103, 5000, 0, REG_RETURN},
-  {73,  5000, 0, REG_FREQUENCY},
-  {127, 5000, 0, REG_HP_RUNNING},
-  {67,  5000, 0, REG_DEFROST},
-  {26,  5000, 0, REG_OPERATING_MODE},
-  {9,   5000, 0, REG_FAULT},
+  {99,  5000, {0}, REG_OUTDOOR},
+  {101, 5000, {0}, REG_FLOW},
+  {103, 5000, {0}, REG_RETURN},
+  {73,  5000, {0}, REG_FREQUENCY},
+  {127, 5000, {0}, REG_HP_RUNNING},
+  {67,  5000, {0}, REG_DEFROST},
+  {26,  5000, {0}, REG_OPERATING_MODE},
+  {9,   5000, {0}, REG_FAULT},
+  {52,  5000, {0}, REG_SETTING_WATER},
+  {25,  5000, {0}, REG_SYSTEM_ON},
 
-  {10, 60000, 0, REG_FIRMWARE},
-  {11, 60000, 0, REG_COUNTER},
-  {13, 60000, 0, REG_SYSTEM_TYPE}
+  {10, 60000, {0}, REG_FIRMWARE},
+  {11, 60000, {0}, REG_COUNTER},
+  {13, 60000, {0}, REG_SYSTEM_TYPE}
 };
 
 
@@ -189,36 +215,35 @@ const unsigned long MODBUS_MIN_GAP = 250;
 const unsigned long MODBUS_OFFLINE_RETRY = 10000;
 
 
-uint8_t pollCursor = 0;
+uint8_t pollCursor[PUMP_COUNT] = {};
+uint8_t pumpCursor = 0;
 
 unsigned long lastModbusTransaction = 0;
-unsigned long nextModbusProbe = 1500;
+struct PumpState {
+  unsigned long nextProbe;
+  uint8_t failures;
+  bool online;
+  bool stateKnown;
+  uint16_t defrost;
+  uint16_t operatingMode;
+  uint16_t fault;
+  uint16_t systemType;
+  bool haveDefrost;
+  bool haveOperatingMode;
+  bool haveFault;
+  bool haveSystemType;
+  int32_t lastDefrostDescription;
+  int32_t lastOperatingDescription;
+  int32_t lastFaultDescription;
+  int32_t lastSystemDescription;
+};
 
-uint8_t consecutiveModbusFailures = 0;
-
-bool modbusOnline = false;
-bool modbusStateKnown = false;
+PumpState pumpState[PUMP_COUNT] = {};
 
 
 // =====================================================
 // STATUSY DO HACKU GPM
 // =====================================================
-
-uint16_t currentDefrost = 0;
-uint16_t currentOperatingMode = 0;
-uint16_t currentFault = 0;
-uint16_t currentSystemType = 0;
-
-bool haveDefrost = false;
-bool haveOperatingMode = false;
-bool haveFault = false;
-bool haveSystemType = false;
-
-int32_t lastDefrostDescription = -1;
-int32_t lastOperatingDescription = -1;
-int32_t lastFaultDescription = -1;
-int32_t lastSystemDescription = -1;
-
 
 // =====================================================
 // SUPLA CONFIG
@@ -275,9 +300,12 @@ void modbusIdle() {
 // =====================================================
 
 bool readHR(
+  uint8_t pump,
   uint16_t address,
   uint16_t &value
 ) {
+
+  node.begin(PUMP_SLAVE_IDS[pump], RS485);
 
   uint8_t result =
     node.readHoldingRegisters(
@@ -297,9 +325,11 @@ bool readHR(
 
 
   Serial.print(
-    "Modbus ERROR addr "
+    "Modbus ERROR slave "
   );
 
+  Serial.print(PUMP_SLAVE_IDS[pump]);
+  Serial.print(" addr ");
   Serial.print(address);
 
   Serial.print(
@@ -320,22 +350,22 @@ bool readHR(
 // MODBUS ONLINE / OFFLINE
 // =====================================================
 
-void setModbusOnline(bool online) {
+void setModbusOnline(uint8_t pump, bool online) {
 
-  if (modbusStateKnown &&
-      modbusOnline == online) {
+  PumpState &state = pumpState[pump];
+  if (state.stateKnown && state.online == online) {
 
     return;
   }
 
 
-  modbusStateKnown = true;
-  modbusOnline = online;
+  state.stateKnown = true;
+  state.online = online;
 
 
   if (online) {
 
-    modbusStatus->set();
+    pumpChannels[pump].online->set();
 
     Serial.println();
     Serial.println(
@@ -344,13 +374,19 @@ void setModbusOnline(bool online) {
   }
   else {
 
-    modbusStatus->clear();
+    pumpChannels[pump].online->clear();
 
     Serial.println();
     Serial.println(
       "MODBUS: OFFLINE"
     );
   }
+
+  Serial.print("Slave: ");
+  Serial.print(PUMP_SLAVE_IDS[pump]);
+  Serial.print(" (");
+  Serial.print(PUMP_NAMES[pump]);
+  Serial.println(")");
 }
 
 
@@ -480,9 +516,16 @@ const char *getSystemTypeText(
 // =====================================================
 
 void applyRegisterValue(
+  uint8_t pump,
   uint8_t type,
   uint16_t raw
 ) {
+
+  PumpChannels &channels = pumpChannels[pump];
+  PumpState &state = pumpState[pump];
+
+  Serial.print(PUMP_NAMES[pump]);
+  Serial.print(" - ");
 
   switch (type) {
 
@@ -498,7 +541,7 @@ void applyRegisterValue(
       double value =
         ((int16_t)raw) / 10.0;
 
-      outdoorTemp->setValue(value);
+      channels.outdoor->setValue(value);
 
       Serial.print("Outdoor: ");
       Serial.print(value);
@@ -519,7 +562,7 @@ void applyRegisterValue(
       double value =
         ((int16_t)raw) / 100.0;
 
-      flowTemp->setValue(value);
+      channels.outlet->setValue(value);
 
       Serial.print("Flow: ");
       Serial.print(value);
@@ -540,7 +583,7 @@ void applyRegisterValue(
       double value =
         ((int16_t)raw) / 100.0;
 
-      returnTemp->setValue(value);
+      channels.inlet->setValue(value);
 
       Serial.print("Return: ");
       Serial.print(value);
@@ -557,7 +600,7 @@ void applyRegisterValue(
 
     case REG_FREQUENCY: {
 
-      hpFrequency->setValue(raw);
+      channels.frequency->setValue(raw);
 
       Serial.print(
         "HP Frequency: "
@@ -580,11 +623,11 @@ void applyRegisterValue(
 
       if (raw == 1) {
 
-        hpRunning->set();
+        channels.running->set();
       }
       else {
 
-        hpRunning->clear();
+        channels.running->clear();
       }
 
 
@@ -605,10 +648,10 @@ void applyRegisterValue(
 
     case REG_DEFROST: {
 
-      defrostStatus->setValue(raw);
+      channels.defrost->setValue(raw);
 
-      currentDefrost = raw;
-      haveDefrost = true;
+      state.defrost = raw;
+      state.haveDefrost = true;
 
 
       Serial.print(
@@ -628,10 +671,10 @@ void applyRegisterValue(
 
     case REG_OPERATING_MODE: {
 
-      operatingMode->setValue(raw);
+      channels.mode->setValue(raw);
 
-      currentOperatingMode = raw;
-      haveOperatingMode = true;
+      state.operatingMode = raw;
+      state.haveOperatingMode = true;
 
 
       Serial.print(
@@ -651,10 +694,10 @@ void applyRegisterValue(
 
     case REG_FAULT: {
 
-      faultCode->setValue(raw);
+      channels.fault->setValue(raw);
 
-      currentFault = raw;
-      haveFault = true;
+      state.fault = raw;
+      state.haveFault = true;
 
 
       Serial.print(
@@ -677,7 +720,7 @@ void applyRegisterValue(
 
     case REG_FIRMWARE: {
 
-      firmwareA1M->setValue(raw);
+      channels.firmware->setValue(raw);
 
       Serial.print(
         "Melco firmware: "
@@ -696,7 +739,7 @@ void applyRegisterValue(
 
     case REG_COUNTER: {
 
-      modbusCounter->setValue(raw);
+      channels.counter->setValue(raw);
 
       Serial.print(
         "Modbus counter: "
@@ -715,10 +758,10 @@ void applyRegisterValue(
 
     case REG_SYSTEM_TYPE: {
 
-      systemType->setValue(raw);
+      channels.systemType->setValue(raw);
 
-      currentSystemType = raw;
-      haveSystemType = true;
+      state.systemType = raw;
+      state.haveSystemType = true;
 
 
       Serial.print(
@@ -729,6 +772,18 @@ void applyRegisterValue(
 
       break;
     }
+
+    case REG_SETTING_WATER:
+      channels.settingWater->setValue(((int16_t)raw) / 100.0);
+      Serial.print("Setting water: ");
+      Serial.println(((int16_t)raw) / 100.0);
+      break;
+
+    case REG_SYSTEM_ON:
+      channels.systemOn->setValue(raw);
+      Serial.print("System on/off: ");
+      Serial.println(raw);
+      break;
   }
 }
 
@@ -740,78 +795,25 @@ void applyRegisterValue(
 // rejestrow. Probujemy tylko addr 99 co 10 s.
 // =====================================================
 
-void handleOfflineModbusProbe() {
-
-  unsigned long now =
-    millis();
-
-
-  if (!timeReached(
-        now,
-        nextModbusProbe)) {
-
-    return;
-  }
-
-
+void handleOfflineModbusProbe(uint8_t pump) {
+  PumpState &state = pumpState[pump];
   uint16_t raw;
 
+  Serial.print("MODBUS: probe slave ");
+  Serial.println(PUMP_SLAVE_IDS[pump]);
 
-  Serial.println(
-    "MODBUS: probe addr 99..."
-  );
-
-
-  bool ok =
-    readHR(
-      99,
-      raw
-    );
-
-
-  lastModbusTransaction =
-    millis();
-
+  bool ok = readHR(pump, 99, raw);
+  lastModbusTransaction = millis();
 
   if (ok) {
-
-    Serial.println(
-      "MODBUS: odpowiedz OK"
-    );
-
-
-    consecutiveModbusFailures = 0;
-
-    setModbusOnline(true);
-
-
-    // addr 99 juz mamy odczytany,
-    // wiec od razu wykorzystujemy wartosc.
-    applyRegisterValue(
-      REG_OUTDOOR,
-      raw
-    );
-
-
-    pollItems[0].lastPoll =
-      millis();
-
-
-    return;
+    state.failures = 0;
+    setModbusOnline(pump, true);
+    applyRegisterValue(pump, REG_OUTDOOR, raw);
+    pollItems[0].lastPoll[pump] = millis();
+  } else {
+    setModbusOnline(pump, false);
+    state.nextProbe = millis() + MODBUS_OFFLINE_RETRY;
   }
-
-
-  setModbusOnline(false);
-
-
-  nextModbusProbe =
-    millis() +
-    MODBUS_OFFLINE_RETRY;
-
-
-  Serial.println(
-    "MODBUS: kolejna proba za 10 s"
-  );
 }
 
 
@@ -823,136 +825,53 @@ void handleOfflineModbusProbe() {
 // =====================================================
 
 void handleModbusScheduler() {
+  if (otaInProgress) return;
 
-  if (otaInProgress) {
+  unsigned long now = millis();
+  if (now - lastModbusTransaction < MODBUS_MIN_GAP) return;
 
-    return;
-  }
+  // Round-robin: nieobecny slave nie blokuje pozostalych pomp.
+  for (uint8_t checked = 0; checked < PUMP_COUNT; checked++) {
+    uint8_t pump = (pumpCursor + checked) % PUMP_COUNT;
+    PumpState &state = pumpState[pump];
 
-
-  // -----------------------------------------------
-  // OFFLINE
-  // -----------------------------------------------
-
-  if (!modbusOnline) {
-
-    handleOfflineModbusProbe();
-
-    return;
-  }
-
-
-  unsigned long now =
-    millis();
-
-
-  // Minimalna przerwa pomiedzy transakcjami.
-  if (now -
-        lastModbusTransaction <
-      MODBUS_MIN_GAP) {
-
-    return;
-  }
-
-
-  // Szukamy pierwszego rejestru,
-  // ktorego termin juz minal.
-  for (
-    uint8_t checked = 0;
-    checked < POLL_ITEM_COUNT;
-    checked++
-  ) {
-
-    uint8_t index =
-      (pollCursor + checked) %
-      POLL_ITEM_COUNT;
-
-
-    ModbusPollItem &item =
-      pollItems[index];
-
-
-    if (now -
-          item.lastPoll <
-        item.interval) {
-
-      continue;
+    if (!state.online) {
+      if (!timeReached(now, state.nextProbe)) continue;
+      pumpCursor = (pump + 1) % PUMP_COUNT;
+      handleOfflineModbusProbe(pump);
+      return;
     }
 
+    for (uint8_t i = 0; i < POLL_ITEM_COUNT; i++) {
+      uint8_t index = (pollCursor[pump] + i) % POLL_ITEM_COUNT;
+      ModbusPollItem &item = pollItems[index];
+      if (now - item.lastPoll[pump] < item.interval) continue;
 
-    pollCursor =
-      (index + 1) %
-      POLL_ITEM_COUNT;
+      pollCursor[pump] = (index + 1) % POLL_ITEM_COUNT;
+      pumpCursor = (pump + 1) % PUMP_COUNT;
 
+      uint16_t raw;
+      bool ok = readHR(pump, item.address, raw);
+      item.lastPoll[pump] = millis();
+      lastModbusTransaction = millis();
 
-    uint16_t raw;
-
-
-    bool ok =
-      readHR(
-        item.address,
-        raw
-      );
-
-
-    item.lastPoll =
-      millis();
-
-
-    lastModbusTransaction =
-      millis();
-
-
-    if (ok) {
-
-      consecutiveModbusFailures = 0;
-
-      applyRegisterValue(
-        item.type,
-        raw
-      );
-    }
-
-    else {
-
-      if (
-        consecutiveModbusFailures <
-        255
-      ) {
-
-        consecutiveModbusFailures++;
+      if (ok) {
+        state.failures = 0;
+        applyRegisterValue(pump, item.type, raw);
+      } else {
+        if (state.failures < 255) state.failures++;
+        Serial.print("Modbus failure streak slave ");
+        Serial.print(PUMP_SLAVE_IDS[pump]);
+        Serial.print(": ");
+        Serial.println(state.failures);
+        if (state.failures >= 3) {
+          setModbusOnline(pump, false);
+          state.failures = 0;
+          state.nextProbe = millis() + MODBUS_OFFLINE_RETRY;
+        }
       }
-
-
-      Serial.print(
-        "Modbus failure streak: "
-      );
-
-      Serial.println(
-        consecutiveModbusFailures
-      );
-
-
-      // 3 kolejne timeouty/bledy =
-      // przechodzimy w tryb offline.
-      if (
-        consecutiveModbusFailures >= 3
-      ) {
-
-        setModbusOnline(false);
-
-        consecutiveModbusFailures = 0;
-
-        nextModbusProbe =
-          millis() +
-          MODBUS_OFFLINE_RETRY;
-      }
+      return;
     }
-
-
-    // Tylko JEDNA transakcja na jedno
-    // wywolanie schedulera.
-    return;
   }
 }
 
@@ -962,43 +881,17 @@ void handleModbusScheduler() {
 // =====================================================
 
 void configureGpmHistory() {
-
-  // Czestotliwosc HP
-  if (
-    hpFrequency->getKeepHistory() != 1
-  ) {
-
-    hpFrequency->setKeepHistory(1);
+  for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
+    PumpChannels &channels = pumpChannels[pump];
+    if (channels.frequency->getKeepHistory() != 1)
+      channels.frequency->setKeepHistory(1);
+    if (channels.fault->getKeepHistory() != 1)
+      channels.fault->setKeepHistory(1);
+    if (channels.defrost->getKeepHistory() != 1)
+      channels.defrost->setKeepHistory(1);
+    if (channels.mode->getKeepHistory() != 1)
+      channels.mode->setKeepHistory(1);
   }
-
-
-  // Kod bledu
-  if (
-    faultCode->getKeepHistory() != 1
-  ) {
-
-    faultCode->setKeepHistory(1);
-  }
-
-
-  // Defrost
-  if (
-    defrostStatus->getKeepHistory() != 1
-  ) {
-
-    defrostStatus->setKeepHistory(1);
-  }
-
-
-  // Tryb pracy
-  if (
-    operatingMode->getKeepHistory() != 1
-  ) {
-
-    operatingMode->setKeepHistory(1);
-  }
-
-
   historyConfigured = true;
 
 
@@ -1047,10 +940,13 @@ void updateStatusDescriptions() {
 
     // Pozwalamy ponownie wyslac opis
     // po reconnect.
-    lastDefrostDescription = -1;
-    lastOperatingDescription = -1;
-    lastFaultDescription = -1;
-    lastSystemDescription = -1;
+    for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
+      PumpState &state = pumpState[pump];
+      state.lastDefrostDescription = -1;
+      state.lastOperatingDescription = -1;
+      state.lastFaultDescription = -1;
+      state.lastSystemDescription = -1;
+    }
 
 
     return;
@@ -1077,91 +973,29 @@ void updateStatusDescriptions() {
   }
 
 
-  // -----------------------------------------------
-  // DEFROST
-  // -----------------------------------------------
-
-  if (
-    haveDefrost &&
-    currentDefrost !=
-      lastDefrostDescription
-  ) {
-
-    defrostStatus->setUnitAfterValue(
-      getDefrostText(
-        currentDefrost
-      )
-    );
-
-
-    lastDefrostDescription =
-      currentDefrost;
-  }
-
-
-  // -----------------------------------------------
-  // OPERATING MODE
-  // -----------------------------------------------
-
-  if (
-    haveOperatingMode &&
-    currentOperatingMode !=
-      lastOperatingDescription
-  ) {
-
-    operatingMode->setUnitAfterValue(
-      getOperatingModeText(
-        currentOperatingMode
-      )
-    );
-
-
-    lastOperatingDescription =
-      currentOperatingMode;
-  }
-
-
-  // -----------------------------------------------
-  // FAULT
-  // -----------------------------------------------
-
-  if (
-    haveFault &&
-    currentFault !=
-      lastFaultDescription
-  ) {
-
-    faultCode->setUnitAfterValue(
-      getFaultText(
-        currentFault
-      )
-    );
-
-
-    lastFaultDescription =
-      currentFault;
-  }
-
-
-  // -----------------------------------------------
-  // SYSTEM TYPE
-  // -----------------------------------------------
-
-  if (
-    haveSystemType &&
-    currentSystemType !=
-      lastSystemDescription
-  ) {
-
-    systemType->setUnitAfterValue(
-      getSystemTypeText(
-        currentSystemType
-      )
-    );
-
-
-    lastSystemDescription =
-      currentSystemType;
+  for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
+    PumpState &state = pumpState[pump];
+    PumpChannels &channels = pumpChannels[pump];
+    if (state.haveDefrost &&
+        state.defrost != state.lastDefrostDescription) {
+      channels.defrost->setUnitAfterValue(getDefrostText(state.defrost));
+      state.lastDefrostDescription = state.defrost;
+    }
+    if (state.haveOperatingMode &&
+        state.operatingMode != state.lastOperatingDescription) {
+      channels.mode->setUnitAfterValue(getOperatingModeText(state.operatingMode));
+      state.lastOperatingDescription = state.operatingMode;
+    }
+    if (state.haveFault &&
+        state.fault != state.lastFaultDescription) {
+      channels.fault->setUnitAfterValue(getFaultText(state.fault));
+      state.lastFaultDescription = state.fault;
+    }
+    if (state.haveSystemType &&
+        state.systemType != state.lastSystemDescription) {
+      channels.systemType->setUnitAfterValue(getSystemTypeText(state.systemType));
+      state.lastSystemDescription = state.systemType;
+    }
   }
 }
 
@@ -1746,6 +1580,12 @@ void handleDiagnostics() {
 // TWORZENIE KANALOW
 // =====================================================
 
+void namePumpChannel(Supla::Element *element, uint8_t pump,
+                     const char *description) {
+  String caption = String(PUMP_NAMES[pump]) + " " + description;
+  element->setInitialCaption(caption.c_str());
+}
+
 void createSuplaChannels() {
 
 
@@ -1943,6 +1783,87 @@ void createSuplaChannels() {
   );
 
   modbusStatus->clear();
+
+  // Kanaly 0-12 zachowuja typ i numer, zmieniaja tylko podpis na CAHV 1.
+  PumpChannels &first = pumpChannels[0];
+  first.outdoor = outdoorTemp;
+  first.outlet = flowTemp;
+  first.inlet = returnTemp;
+  first.frequency = hpFrequency;
+  first.running = hpRunning;
+  first.fault = faultCode;
+  first.firmware = firmwareA1M;
+  first.counter = modbusCounter;
+  first.systemType = systemType;
+  first.defrost = defrostStatus;
+  first.mode = operatingMode;
+  first.online = modbusStatus;
+
+  namePumpChannel(first.outdoor, 0, "Temperatura zewnetrzna");
+  namePumpChannel(first.outlet, 0, "Wylot wody");
+  namePumpChannel(first.inlet, 0, "Wlot wody");
+  namePumpChannel(first.frequency, 0, "Czestotliwosc HP");
+  namePumpChannel(first.running, 0, "Praca pompy");
+  namePumpChannel(first.fault, 0, "Kod bledu");
+  namePumpChannel(first.firmware, 0, "Firmware A1M");
+  namePumpChannel(first.counter, 0, "Licznik Modbus");
+  namePumpChannel(first.systemType, 0, "Typ systemu");
+  namePumpChannel(first.defrost, 0, "Odszranianie");
+  namePumpChannel(first.mode, 0, "Tryb pracy");
+  namePumpChannel(first.online, 0, "Komunikacja Modbus");
+
+  // 13-14: dodatkowe odczyty CAHV 1.
+  first.settingWater = new Supla::Sensor::VirtualThermometer();
+  namePumpChannel(first.settingWater, 0, "Temperatura zadana wody");
+  first.systemOn = new Supla::Sensor::GeneralPurposeMeasurement();
+  namePumpChannel(first.systemOn, 0, "System ON/OFF");
+  first.systemOn->setDefaultValuePrecision(0);
+
+  // 15-28: CAHV 2, 29-42: QAHV. W obu zestawach identyczna kolejnosc.
+  for (uint8_t pump = 1; pump < PUMP_COUNT; pump++) {
+    PumpChannels &channels = pumpChannels[pump];
+    channels.outdoor = new Supla::Sensor::VirtualThermometer();
+    namePumpChannel(channels.outdoor, pump, "Temperatura zewnetrzna");
+    channels.outlet = new Supla::Sensor::VirtualThermometer();
+    namePumpChannel(channels.outlet, pump, "Wylot wody");
+    channels.inlet = new Supla::Sensor::VirtualThermometer();
+    namePumpChannel(channels.inlet, pump, "Wlot wody");
+
+    channels.frequency = new Supla::Sensor::GeneralPurposeMeasurement();
+    namePumpChannel(channels.frequency, pump, "Czestotliwosc HP");
+    channels.frequency->setDefaultUnitAfterValue("Hz");
+    channels.frequency->setDefaultValuePrecision(0);
+    channels.running = new Supla::Sensor::VirtualBinary();
+    namePumpChannel(channels.running, pump, "Praca pompy");
+
+    channels.fault = new Supla::Sensor::GeneralPurposeMeasurement();
+    namePumpChannel(channels.fault, pump, "Kod bledu");
+    channels.fault->setDefaultValuePrecision(0);
+    channels.firmware = new Supla::Sensor::GeneralPurposeMeasurement();
+    namePumpChannel(channels.firmware, pump, "Firmware A1M");
+    channels.firmware->setDefaultValuePrecision(0);
+    channels.counter = new Supla::Sensor::GeneralPurposeMeasurement();
+    namePumpChannel(channels.counter, pump, "Licznik Modbus");
+    channels.counter->setDefaultValuePrecision(0);
+    channels.systemType = new Supla::Sensor::GeneralPurposeMeasurement();
+    namePumpChannel(channels.systemType, pump, "Typ systemu");
+    channels.systemType->setDefaultValuePrecision(0);
+
+    channels.defrost = new Supla::Sensor::GeneralPurposeMeasurement();
+    namePumpChannel(channels.defrost, pump, "Odszranianie");
+    channels.defrost->setDefaultValuePrecision(0);
+    channels.mode = new Supla::Sensor::GeneralPurposeMeasurement();
+    namePumpChannel(channels.mode, pump, "Tryb pracy");
+    channels.mode->setDefaultValuePrecision(0);
+    channels.online = new Supla::Sensor::VirtualBinary();
+    namePumpChannel(channels.online, pump, "Komunikacja Modbus");
+    channels.online->clear();
+    channels.settingWater = new Supla::Sensor::VirtualThermometer();
+    namePumpChannel(channels.settingWater, pump, "Temperatura zadana wody");
+    channels.systemOn = new Supla::Sensor::GeneralPurposeMeasurement();
+    namePumpChannel(channels.systemOn, pump, "System ON/OFF");
+    channels.systemOn->setDefaultValuePrecision(0);
+  }
 }
 
 
@@ -1996,10 +1917,7 @@ void setup() {
   );
 
 
-  node.begin(
-    MODBUS_SLAVE_ID,
-    RS485
-  );
+  node.begin(PUMP_SLAVE_IDS[0], RS485);
 
 
   // Kluczowa rzecz:
@@ -2028,13 +1946,17 @@ void setup() {
 
   createSuplaChannels();
 
+  for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
+    pumpState[pump].nextProbe = millis() + 1500;
+  }
+
 
   // =================================================
   // DEVICE
   // =================================================
 
   SuplaDevice.setName(
-    "Mitsubishi MelcoBEMS"
+    "Kotlownia - 3 pompy MelcoBEMS"
   );
 
 
