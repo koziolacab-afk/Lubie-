@@ -26,7 +26,7 @@
 // WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.7"
+#define FW_VERSION "1.0.8"
 
 
 // =====================================================
@@ -84,7 +84,8 @@ ModbusMaster node;
 // =====================================================
 
 Supla::ESPWifi wifi;
-Supla::LittleFsConfig configSupla;
+// The default 1024-byte config buffer cannot hold settings for all 46 channels.
+Supla::LittleFsConfig configSupla(16384);
 Supla::EspWebServer suplaServer;
 
 
