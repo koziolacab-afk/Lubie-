@@ -26,7 +26,7 @@
 // WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.2"
+#define FW_VERSION "1.0.3"
 
 
 // =====================================================
@@ -47,8 +47,16 @@ unsigned long lastOtaVerifyAttempt = 0;
 int otaLastProgress = -1;
 
 
-// Arduino ESP32 ma domyslna automatyczna walidacje.
-// My odraczamy ja i zatwierdzamy firmware dopiero po 60 s.
+// =====================================================
+// ROLLBACK
+//
+// Arduino ESP32 normalnie moze automatycznie
+// zatwierdzic nowy firmware bardzo szybko.
+//
+// Odkladamy walidacje i robimy ja sami
+// po 60 sekundach poprawnej pracy.
+// =====================================================
+
 extern "C" bool verifyRollbackLater() {
   return true;
 }
@@ -81,40 +89,115 @@ Supla::EspWebServer suplaServer;
 // KANALY SUPLA
 // =====================================================
 
-// Temperatury
+// 0
 Supla::Sensor::VirtualThermometer *outdoorTemp;
+
+// 1
 Supla::Sensor::VirtualThermometer *flowTemp;
+
+// 2
 Supla::Sensor::VirtualThermometer *returnTemp;
 
-// GPM
+// 3
 Supla::Sensor::GeneralPurposeMeasurement *hpFrequency;
-Supla::Sensor::GeneralPurposeMeasurement *faultCode;
-Supla::Sensor::GeneralPurposeMeasurement *firmwareA1M;
-Supla::Sensor::GeneralPurposeMeasurement *modbusCounter;
-Supla::Sensor::GeneralPurposeMeasurement *systemType;
 
-// Binary
+// 4
 Supla::Sensor::VirtualBinary *hpRunning;
 
-// OTA
+// 5
+Supla::Sensor::GeneralPurposeMeasurement *faultCode;
+
+// 6
+Supla::Sensor::GeneralPurposeMeasurement *firmwareA1M;
+
+// 7
+Supla::Sensor::GeneralPurposeMeasurement *modbusCounter;
+
+// 8
+Supla::Sensor::GeneralPurposeMeasurement *systemType;
+
+// 9
 Supla::Control::VirtualRelay *otaTrigger;
 
-// Statusy z opisami
+// 10
 Supla::Sensor::GeneralPurposeMeasurement *defrostStatus;
+
+// 11
 Supla::Sensor::GeneralPurposeMeasurement *operatingMode;
 
+// 12
+Supla::Sensor::VirtualBinary *modbusStatus;
+
 
 // =====================================================
-// MODBUS TIMERY
+// MODBUS - SCHEDULER
 // =====================================================
 
-const unsigned long FAST_POLL_INTERVAL = 5000;
-const unsigned long SLOW_POLL_INTERVAL = 60000;
+enum RegisterType {
+  REG_OUTDOOR,
+  REG_FLOW,
+  REG_RETURN,
+  REG_FREQUENCY,
+  REG_HP_RUNNING,
+  REG_DEFROST,
+  REG_OPERATING_MODE,
+  REG_FAULT,
+  REG_FIRMWARE,
+  REG_COUNTER,
+  REG_SYSTEM_TYPE
+};
 
-unsigned long lastFastPoll = 0;
-unsigned long lastSlowPoll = 0;
+void applyRegisterValue(RegisterType type, uint16_t raw);
 
-bool firstSlowPoll = true;
+struct ModbusPollItem {
+  uint16_t address;
+  unsigned long interval;
+  unsigned long lastPoll;
+  RegisterType type;
+};
+
+
+// Rejestry dynamiczne: 5 s
+// Rejestry diagnostyczne: 60 s
+ModbusPollItem pollItems[] = {
+
+  {99,  5000, 0, REG_OUTDOOR},
+  {101, 5000, 0, REG_FLOW},
+  {103, 5000, 0, REG_RETURN},
+  {73,  5000, 0, REG_FREQUENCY},
+  {127, 5000, 0, REG_HP_RUNNING},
+  {67,  5000, 0, REG_DEFROST},
+  {26,  5000, 0, REG_OPERATING_MODE},
+  {9,   5000, 0, REG_FAULT},
+
+  {10, 60000, 0, REG_FIRMWARE},
+  {11, 60000, 0, REG_COUNTER},
+  {13, 60000, 0, REG_SYSTEM_TYPE}
+};
+
+
+const uint8_t POLL_ITEM_COUNT =
+  sizeof(pollItems) / sizeof(pollItems[0]);
+
+
+// Minimalna przerwa pomiedzy poprawnymi transakcjami.
+const unsigned long MODBUS_MIN_GAP = 250;
+
+
+// Po utracie komunikacji probujemy tylko jednego
+// rejestru co 10 sekund.
+const unsigned long MODBUS_OFFLINE_RETRY = 10000;
+
+
+uint8_t pollCursor = 0;
+
+unsigned long lastModbusTransaction = 0;
+unsigned long nextModbusProbe = 1500;
+
+uint8_t consecutiveModbusFailures = 0;
+
+bool modbusOnline = false;
+bool modbusStateKnown = false;
 
 
 // =====================================================
@@ -137,7 +220,10 @@ int32_t lastFaultDescription = -1;
 int32_t lastSystemDescription = -1;
 
 
-// SUPLA config sync
+// =====================================================
+// SUPLA CONFIG
+// =====================================================
+
 bool suplaWasReady = false;
 bool historyConfigured = false;
 
@@ -147,36 +233,137 @@ const unsigned long SUPLA_CONFIG_SETTLE_TIME = 5000;
 
 
 // =====================================================
-// MODBUS
+// DIAGNOSTYKA
 // =====================================================
 
-bool readHR(uint16_t address, uint16_t &value) {
+int lastWifiStatus = -100;
+int lastSuplaStatus = -100;
+
+unsigned long lastDiagnosticsCheck = 0;
+
+
+// =====================================================
+// POMOCNICZE
+// =====================================================
+
+bool timeReached(
+  unsigned long now,
+  unsigned long target
+) {
+
+  return (int32_t)(now - target) >= 0;
+}
+
+
+// =====================================================
+// MODBUS IDLE
+//
+// ModbusMaster moze czekac 2 sekundy na timeout.
+// W tym czasie MUSIMY obslugiwac SUPLA.
+// =====================================================
+
+void modbusIdle() {
+
+  SuplaDevice.iterate();
+
+  yield();
+}
+
+
+// =====================================================
+// MODBUS READ
+// =====================================================
+
+bool readHR(
+  uint16_t address,
+  uint16_t &value
+) {
 
   uint8_t result =
-    node.readHoldingRegisters(address, 1);
+    node.readHoldingRegisters(
+      address,
+      1
+    );
 
-  if (result == node.ku8MBSuccess) {
 
-    value = node.getResponseBuffer(0);
+  if (result ==
+      node.ku8MBSuccess) {
+
+    value =
+      node.getResponseBuffer(0);
 
     return true;
   }
 
-  Serial.print("Modbus ERROR addr ");
+
+  Serial.print(
+    "Modbus ERROR addr "
+  );
+
   Serial.print(address);
-  Serial.print(" -> 0x");
-  Serial.println(result, HEX);
+
+  Serial.print(
+    " -> 0x"
+  );
+
+  Serial.println(
+    result,
+    HEX
+  );
+
 
   return false;
 }
 
 
 // =====================================================
-// TEKSTY STATUSOW
-// max 14 bajtow dla unit GPM
+// MODBUS ONLINE / OFFLINE
 // =====================================================
 
-const char *getDefrostText(uint16_t value) {
+void setModbusOnline(bool online) {
+
+  if (modbusStateKnown &&
+      modbusOnline == online) {
+
+    return;
+  }
+
+
+  modbusStateKnown = true;
+  modbusOnline = online;
+
+
+  if (online) {
+
+    modbusStatus->set();
+
+    Serial.println();
+    Serial.println(
+      "MODBUS: ONLINE"
+    );
+  }
+  else {
+
+    modbusStatus->clear();
+
+    Serial.println();
+    Serial.println(
+      "MODBUS: OFFLINE"
+    );
+  }
+}
+
+
+// =====================================================
+// TEKSTY STATUSOW
+//
+// Unit GPM ma ograniczona dlugosc,
+// dlatego teksty sa krotkie.
+// =====================================================
+
+const char *getDefrostText(
+  uint16_t value
+) {
 
   switch (value) {
 
@@ -198,7 +385,9 @@ const char *getDefrostText(uint16_t value) {
 }
 
 
-const char *getOperatingModeText(uint16_t value) {
+const char *getOperatingModeText(
+  uint16_t value
+) {
 
   switch (value) {
 
@@ -244,13 +433,17 @@ const char *getOperatingModeText(uint16_t value) {
 }
 
 
-const char *getFaultText(uint16_t value) {
+const char *getFaultText(
+  uint16_t value
+) {
 
   if (value == 0x8000) {
+
     return "OK";
   }
 
   if (value == 0x6999) {
+
     return "Comm error";
   }
 
@@ -258,7 +451,9 @@ const char *getFaultText(uint16_t value) {
 }
 
 
-const char *getSystemTypeText(uint16_t value) {
+const char *getSystemTypeText(
+  uint16_t value
+) {
 
   switch (value) {
 
@@ -281,42 +476,549 @@ const char *getSystemTypeText(uint16_t value) {
 
 
 // =====================================================
+// PRZETWARZANIE REJESTROW
+// =====================================================
+
+void applyRegisterValue(
+  RegisterType type,
+  uint16_t raw
+) {
+
+  switch (type) {
+
+
+    // -----------------------------------------------
+    // Outdoor temp
+    // addr 99
+    // signed / 10
+    // -----------------------------------------------
+
+    case REG_OUTDOOR: {
+
+      double value =
+        ((int16_t)raw) / 10.0;
+
+      outdoorTemp->setValue(value);
+
+      Serial.print("Outdoor: ");
+      Serial.print(value);
+      Serial.println(" C");
+
+      break;
+    }
+
+
+    // -----------------------------------------------
+    // Flow temp
+    // addr 101
+    // signed / 100
+    // -----------------------------------------------
+
+    case REG_FLOW: {
+
+      double value =
+        ((int16_t)raw) / 100.0;
+
+      flowTemp->setValue(value);
+
+      Serial.print("Flow: ");
+      Serial.print(value);
+      Serial.println(" C");
+
+      break;
+    }
+
+
+    // -----------------------------------------------
+    // Return temp
+    // addr 103
+    // signed / 100
+    // -----------------------------------------------
+
+    case REG_RETURN: {
+
+      double value =
+        ((int16_t)raw) / 100.0;
+
+      returnTemp->setValue(value);
+
+      Serial.print("Return: ");
+      Serial.print(value);
+      Serial.println(" C");
+
+      break;
+    }
+
+
+    // -----------------------------------------------
+    // HP Frequency
+    // addr 73
+    // -----------------------------------------------
+
+    case REG_FREQUENCY: {
+
+      hpFrequency->setValue(raw);
+
+      Serial.print(
+        "HP Frequency: "
+      );
+
+      Serial.print(raw);
+
+      Serial.println(" Hz");
+
+      break;
+    }
+
+
+    // -----------------------------------------------
+    // HP Run
+    // addr 127
+    // -----------------------------------------------
+
+    case REG_HP_RUNNING: {
+
+      if (raw == 1) {
+
+        hpRunning->set();
+      }
+      else {
+
+        hpRunning->clear();
+      }
+
+
+      Serial.print(
+        "HP Run: "
+      );
+
+      Serial.println(raw);
+
+      break;
+    }
+
+
+    // -----------------------------------------------
+    // Defrost
+    // addr 67
+    // -----------------------------------------------
+
+    case REG_DEFROST: {
+
+      defrostStatus->setValue(raw);
+
+      currentDefrost = raw;
+      haveDefrost = true;
+
+
+      Serial.print(
+        "Defrost: "
+      );
+
+      Serial.println(raw);
+
+      break;
+    }
+
+
+    // -----------------------------------------------
+    // Operating mode
+    // addr 26
+    // -----------------------------------------------
+
+    case REG_OPERATING_MODE: {
+
+      operatingMode->setValue(raw);
+
+      currentOperatingMode = raw;
+      haveOperatingMode = true;
+
+
+      Serial.print(
+        "Operating mode: "
+      );
+
+      Serial.println(raw);
+
+      break;
+    }
+
+
+    // -----------------------------------------------
+    // Fault code
+    // addr 9
+    // -----------------------------------------------
+
+    case REG_FAULT: {
+
+      faultCode->setValue(raw);
+
+      currentFault = raw;
+      haveFault = true;
+
+
+      Serial.print(
+        "Fault: 0x"
+      );
+
+      Serial.println(
+        raw,
+        HEX
+      );
+
+      break;
+    }
+
+
+    // -----------------------------------------------
+    // Melco firmware
+    // addr 10
+    // -----------------------------------------------
+
+    case REG_FIRMWARE: {
+
+      firmwareA1M->setValue(raw);
+
+      Serial.print(
+        "Melco firmware: "
+      );
+
+      Serial.println(raw);
+
+      break;
+    }
+
+
+    // -----------------------------------------------
+    // Modbus counter
+    // addr 11
+    // -----------------------------------------------
+
+    case REG_COUNTER: {
+
+      modbusCounter->setValue(raw);
+
+      Serial.print(
+        "Modbus counter: "
+      );
+
+      Serial.println(raw);
+
+      break;
+    }
+
+
+    // -----------------------------------------------
+    // System type
+    // addr 13
+    // -----------------------------------------------
+
+    case REG_SYSTEM_TYPE: {
+
+      systemType->setValue(raw);
+
+      currentSystemType = raw;
+      haveSystemType = true;
+
+
+      Serial.print(
+        "System type: "
+      );
+
+      Serial.println(raw);
+
+      break;
+    }
+  }
+}
+
+
+// =====================================================
+// MODBUS PROBE
+//
+// Kiedy A1M jest offline nie odpytujemy wszystkich
+// rejestrow. Probujemy tylko addr 99 co 10 s.
+// =====================================================
+
+void handleOfflineModbusProbe() {
+
+  unsigned long now =
+    millis();
+
+
+  if (!timeReached(
+        now,
+        nextModbusProbe)) {
+
+    return;
+  }
+
+
+  uint16_t raw;
+
+
+  Serial.println(
+    "MODBUS: probe addr 99..."
+  );
+
+
+  bool ok =
+    readHR(
+      99,
+      raw
+    );
+
+
+  lastModbusTransaction =
+    millis();
+
+
+  if (ok) {
+
+    Serial.println(
+      "MODBUS: odpowiedz OK"
+    );
+
+
+    consecutiveModbusFailures = 0;
+
+    setModbusOnline(true);
+
+
+    // addr 99 juz mamy odczytany,
+    // wiec od razu wykorzystujemy wartosc.
+    applyRegisterValue(
+      REG_OUTDOOR,
+      raw
+    );
+
+
+    pollItems[0].lastPoll =
+      millis();
+
+
+    return;
+  }
+
+
+  setModbusOnline(false);
+
+
+  nextModbusProbe =
+    millis() +
+    MODBUS_OFFLINE_RETRY;
+
+
+  Serial.println(
+    "MODBUS: kolejna proba za 10 s"
+  );
+}
+
+
+// =====================================================
+// MODBUS SCHEDULER
+//
+// Jedna transakcja na raz.
+// Nie robimy juz 8 timeoutow jeden po drugim.
+// =====================================================
+
+void handleModbusScheduler() {
+
+  if (otaInProgress) {
+
+    return;
+  }
+
+
+  // -----------------------------------------------
+  // OFFLINE
+  // -----------------------------------------------
+
+  if (!modbusOnline) {
+
+    handleOfflineModbusProbe();
+
+    return;
+  }
+
+
+  unsigned long now =
+    millis();
+
+
+  // Minimalna przerwa pomiedzy transakcjami.
+  if (now -
+        lastModbusTransaction <
+      MODBUS_MIN_GAP) {
+
+    return;
+  }
+
+
+  // Szukamy pierwszego rejestru,
+  // ktorego termin juz minal.
+  for (
+    uint8_t checked = 0;
+    checked < POLL_ITEM_COUNT;
+    checked++
+  ) {
+
+    uint8_t index =
+      (pollCursor + checked) %
+      POLL_ITEM_COUNT;
+
+
+    ModbusPollItem &item =
+      pollItems[index];
+
+
+    if (now -
+          item.lastPoll <
+        item.interval) {
+
+      continue;
+    }
+
+
+    pollCursor =
+      (index + 1) %
+      POLL_ITEM_COUNT;
+
+
+    uint16_t raw;
+
+
+    bool ok =
+      readHR(
+        item.address,
+        raw
+      );
+
+
+    item.lastPoll =
+      millis();
+
+
+    lastModbusTransaction =
+      millis();
+
+
+    if (ok) {
+
+      consecutiveModbusFailures = 0;
+
+      applyRegisterValue(
+        item.type,
+        raw
+      );
+    }
+
+    else {
+
+      if (
+        consecutiveModbusFailures <
+        255
+      ) {
+
+        consecutiveModbusFailures++;
+      }
+
+
+      Serial.print(
+        "Modbus failure streak: "
+      );
+
+      Serial.println(
+        consecutiveModbusFailures
+      );
+
+
+      // 3 kolejne timeouty/bledy =
+      // przechodzimy w tryb offline.
+      if (
+        consecutiveModbusFailures >= 3
+      ) {
+
+        setModbusOnline(false);
+
+        consecutiveModbusFailures = 0;
+
+        nextModbusProbe =
+          millis() +
+          MODBUS_OFFLINE_RETRY;
+      }
+    }
+
+
+    // Tylko JEDNA transakcja na jedno
+    // wywolanie schedulera.
+    return;
+  }
+}
+
+
+// =====================================================
 // HISTORIA GPM
 // =====================================================
 
 void configureGpmHistory() {
 
-  // Ustawiamy tylko kanaly, gdzie historia ma sens.
+  // Czestotliwosc HP
+  if (
+    hpFrequency->getKeepHistory() != 1
+  ) {
 
-  if (hpFrequency->getKeepHistory() != 1) {
     hpFrequency->setKeepHistory(1);
   }
 
-  if (faultCode->getKeepHistory() != 1) {
+
+  // Kod bledu
+  if (
+    faultCode->getKeepHistory() != 1
+  ) {
+
     faultCode->setKeepHistory(1);
   }
 
-  if (defrostStatus->getKeepHistory() != 1) {
+
+  // Defrost
+  if (
+    defrostStatus->getKeepHistory() != 1
+  ) {
+
     defrostStatus->setKeepHistory(1);
   }
 
-  if (operatingMode->getKeepHistory() != 1) {
+
+  // Tryb pracy
+  if (
+    operatingMode->getKeepHistory() != 1
+  ) {
+
     operatingMode->setKeepHistory(1);
   }
 
+
   historyConfigured = true;
 
-  Serial.println("SUPLA: historia GPM skonfigurowana");
+
+  Serial.println(
+    "SUPLA: historia GPM wlaczona"
+  );
 }
 
 
 // =====================================================
-// HACK STATUS -> GPM
+// STATUS TEXT HACK
 //
-// np.
+// Wynik w SUPLA:
+//
 // 2 Defrost
 // 2 Heating
 // 32768 OK
+// 1 ATW
+//
+// Aktualizujemy unit TYLKO po zmianie statusu.
 // =====================================================
 
 void updateStatusDescriptions() {
@@ -338,79 +1040,125 @@ void updateStatusDescriptions() {
   if (!suplaWasReady) {
 
     suplaWasReady = true;
-    suplaReadySince = millis();
 
-    // Po reconnect pozwalamy odswiezyc opis.
+    suplaReadySince =
+      millis();
+
+
+    // Pozwalamy ponownie wyslac opis
+    // po reconnect.
     lastDefrostDescription = -1;
     lastOperatingDescription = -1;
     lastFaultDescription = -1;
     lastSystemDescription = -1;
 
-    return;
-  }
-
-
-  // Dajemy SUPLA chwile na pobranie konfiguracji kanalow.
-  if (millis() - suplaReadySince <
-      SUPLA_CONFIG_SETTLE_TIME) {
 
     return;
   }
 
 
-  // Historia ustawiana raz po uruchomieniu.
+  // SUPLA musi miec chwile na pobranie
+  // konfiguracji kanalow.
+  if (
+    millis() -
+      suplaReadySince <
+    SUPLA_CONFIG_SETTLE_TIME
+  ) {
+
+    return;
+  }
+
+
+  // Historia ustawiana po synchronizacji
+  // konfiguracji z Cloud.
   if (!historyConfigured) {
 
     configureGpmHistory();
   }
 
 
-  // Defrost
-  if (haveDefrost &&
-      currentDefrost != lastDefrostDescription) {
+  // -----------------------------------------------
+  // DEFROST
+  // -----------------------------------------------
+
+  if (
+    haveDefrost &&
+    currentDefrost !=
+      lastDefrostDescription
+  ) {
 
     defrostStatus->setUnitAfterValue(
-      getDefrostText(currentDefrost)
+      getDefrostText(
+        currentDefrost
+      )
     );
+
 
     lastDefrostDescription =
       currentDefrost;
   }
 
 
-  // Operating mode
-  if (haveOperatingMode &&
-      currentOperatingMode != lastOperatingDescription) {
+  // -----------------------------------------------
+  // OPERATING MODE
+  // -----------------------------------------------
+
+  if (
+    haveOperatingMode &&
+    currentOperatingMode !=
+      lastOperatingDescription
+  ) {
 
     operatingMode->setUnitAfterValue(
-      getOperatingModeText(currentOperatingMode)
+      getOperatingModeText(
+        currentOperatingMode
+      )
     );
+
 
     lastOperatingDescription =
       currentOperatingMode;
   }
 
 
-  // Fault
-  if (haveFault &&
-      currentFault != lastFaultDescription) {
+  // -----------------------------------------------
+  // FAULT
+  // -----------------------------------------------
+
+  if (
+    haveFault &&
+    currentFault !=
+      lastFaultDescription
+  ) {
 
     faultCode->setUnitAfterValue(
-      getFaultText(currentFault)
+      getFaultText(
+        currentFault
+      )
     );
+
 
     lastFaultDescription =
       currentFault;
   }
 
 
-  // System type
-  if (haveSystemType &&
-      currentSystemType != lastSystemDescription) {
+  // -----------------------------------------------
+  // SYSTEM TYPE
+  // -----------------------------------------------
+
+  if (
+    haveSystemType &&
+    currentSystemType !=
+      lastSystemDescription
+  ) {
 
     systemType->setUnitAfterValue(
-      getSystemTypeText(currentSystemType)
+      getSystemTypeText(
+        currentSystemType
+      )
     );
+
 
     lastSystemDescription =
       currentSystemType;
@@ -419,208 +1167,7 @@ void updateStatusDescriptions() {
 
 
 // =====================================================
-// FAST MODBUS
-// co 5 sekund
-// =====================================================
-
-void readFastModbus() {
-
-  uint16_t raw;
-
-
-  // -------------------------------------------------
-  // 99 - Outdoor Ambient Temperature
-  // signed / 10
-  // -------------------------------------------------
-
-  if (readHR(99, raw)) {
-
-    double value =
-      ((int16_t)raw) / 10.0;
-
-    outdoorTemp->setValue(value);
-
-    Serial.print("Outdoor: ");
-    Serial.print(value);
-    Serial.println(" C");
-  }
-
-
-  // -------------------------------------------------
-  // 101 - Flow Temperature
-  // signed / 100
-  // -------------------------------------------------
-
-  if (readHR(101, raw)) {
-
-    double value =
-      ((int16_t)raw) / 100.0;
-
-    flowTemp->setValue(value);
-
-    Serial.print("Flow: ");
-    Serial.print(value);
-    Serial.println(" C");
-  }
-
-
-  // -------------------------------------------------
-  // 103 - Return Temperature
-  // signed / 100
-  // -------------------------------------------------
-
-  if (readHR(103, raw)) {
-
-    double value =
-      ((int16_t)raw) / 100.0;
-
-    returnTemp->setValue(value);
-
-    Serial.print("Return: ");
-    Serial.print(value);
-    Serial.println(" C");
-  }
-
-
-  // -------------------------------------------------
-  // 73 - Heat Pump Frequency
-  // Hz
-  // -------------------------------------------------
-
-  if (readHR(73, raw)) {
-
-    hpFrequency->setValue(raw);
-
-    Serial.print("HP Frequency: ");
-    Serial.print(raw);
-    Serial.println(" Hz");
-  }
-
-
-  // -------------------------------------------------
-  // 127 - Heat Pump Master RUN
-  // -------------------------------------------------
-
-  if (readHR(127, raw)) {
-
-    if (raw == 1) {
-      hpRunning->set();
-    }
-    else {
-      hpRunning->clear();
-    }
-
-    Serial.print("HP Run: ");
-    Serial.println(raw);
-  }
-
-
-  // -------------------------------------------------
-  // 67 - Defrost status
-  //
-  // 0 Normal
-  // 1 Standby
-  // 2 Defrost
-  // 3 Waiting Restart
-  // -------------------------------------------------
-
-  if (readHR(67, raw)) {
-
-    defrostStatus->setValue(raw);
-
-    currentDefrost = raw;
-    haveDefrost = true;
-
-    Serial.print("Defrost status: ");
-    Serial.println(raw);
-  }
-
-
-  // -------------------------------------------------
-  // 26 - Operating Mode
-  // -------------------------------------------------
-
-  if (readHR(26, raw)) {
-
-    operatingMode->setValue(raw);
-
-    currentOperatingMode = raw;
-    haveOperatingMode = true;
-
-    Serial.print("Operating mode: ");
-    Serial.println(raw);
-  }
-
-
-  // -------------------------------------------------
-  // 9 - Fault Code
-  // -------------------------------------------------
-
-  if (readHR(9, raw)) {
-
-    faultCode->setValue(raw);
-
-    currentFault = raw;
-    haveFault = true;
-
-    Serial.print("Fault: 0x");
-    Serial.println(raw, HEX);
-  }
-
-
-  Serial.println("-----------------------------");
-}
-
-
-// =====================================================
-// SLOW MODBUS
-// co 60 sekund
-// =====================================================
-
-void readSlowModbus() {
-
-  uint16_t raw;
-
-
-  // 10 - MelcoBEMS firmware
-
-  if (readHR(10, raw)) {
-
-    firmwareA1M->setValue(raw);
-
-    Serial.print("Melco FW raw: ");
-    Serial.println(raw);
-  }
-
-
-  // 11 - Modbus communication counter
-
-  if (readHR(11, raw)) {
-
-    modbusCounter->setValue(raw);
-
-    Serial.print("Modbus counter: ");
-    Serial.println(raw);
-  }
-
-
-  // 13 - System type
-
-  if (readHR(13, raw)) {
-
-    systemType->setValue(raw);
-
-    currentSystemType = raw;
-    haveSystemType = true;
-
-    Serial.print("System type: ");
-    Serial.println(raw);
-  }
-}
-
-
-// =====================================================
-// ROLLBACK - START
+// ROLLBACK - STAN
 // =====================================================
 
 void initRollbackState() {
@@ -628,42 +1175,80 @@ void initRollbackState() {
   const esp_partition_t *running =
     esp_ota_get_running_partition();
 
+
+  Serial.print(
+    "Running partition: "
+  );
+
+
+  if (running) {
+
+    Serial.println(
+      running->label
+    );
+  }
+  else {
+
+    Serial.println(
+      "unknown"
+    );
+
+    return;
+  }
+
+
   esp_ota_img_states_t state;
 
 
-  Serial.print("Running partition: ");
+  if (
+    esp_ota_get_state_partition(
+      running,
+      &state
+    ) == ESP_OK
+  ) {
 
-  if (running) {
-    Serial.println(running->label);
-  }
-  else {
-    Serial.println("unknown");
-  }
+    if (
+      state ==
+      ESP_OTA_IMG_PENDING_VERIFY
+    ) {
 
+      otaPendingVerification =
+        true;
 
-  if (esp_ota_get_state_partition(
-        running,
-        &state) == ESP_OK) {
+      otaVerifyStart =
+        millis();
 
-    if (state ==
-        ESP_OTA_IMG_PENDING_VERIFY) {
-
-      otaPendingVerification = true;
-      otaVerifyStart = millis();
 
       Serial.println();
-      Serial.println("==============================");
-      Serial.println("OTA PENDING_VERIFY");
-      Serial.println("Rollback aktywny");
-      Serial.println("Test firmware: 60 sekund");
-      Serial.println("==============================");
+      Serial.println(
+        "=============================="
+      );
+
+      Serial.println(
+        "OTA PENDING_VERIFY"
+      );
+
+      Serial.println(
+        "Rollback aktywny"
+      );
+
+      Serial.println(
+        "Test firmware: 60 s"
+      );
+
+      Serial.println(
+        "=============================="
+      );
+
 
       return;
     }
   }
 
 
-  Serial.println("OTA: firmware VALID");
+  Serial.println(
+    "OTA: firmware VALID"
+  );
 }
 
 
@@ -673,66 +1258,110 @@ void initRollbackState() {
 
 void handleRollbackVerification() {
 
-  if (!otaPendingVerification) {
-    return;
-  }
-
-
-  unsigned long now = millis();
-
-
-  if (now - otaVerifyStart <
-      OTA_VERIFY_DELAY) {
+  if (
+    !otaPendingVerification
+  ) {
 
     return;
   }
 
 
-  if (now - lastOtaVerifyAttempt <
-      5000) {
+  unsigned long now =
+    millis();
+
+
+  if (
+    now -
+      otaVerifyStart <
+    OTA_VERIFY_DELAY
+  ) {
 
     return;
   }
 
 
-  lastOtaVerifyAttempt = now;
+  if (
+    now -
+      lastOtaVerifyAttempt <
+    5000
+  ) {
+
+    return;
+  }
+
+
+  lastOtaVerifyAttempt =
+    now;
 
 
   bool wifiOK =
-    WiFi.status() == WL_CONNECTED;
+    WiFi.status() ==
+    WL_CONNECTED;
+
 
   bool suplaOK =
     SuplaDevice.getCurrentStatus() ==
     STATUS_REGISTERED_AND_READY;
 
 
-  Serial.print("OTA VERIFY | WiFi: ");
   Serial.print(
-    wifiOK ? "OK" : "BRAK"
+    "OTA VERIFY | WiFi: "
   );
 
-  Serial.print(" | SUPLA: ");
+  Serial.print(
+    wifiOK ?
+    "OK" :
+    "BRAK"
+  );
+
+
+  Serial.print(
+    " | SUPLA: "
+  );
+
   Serial.println(
-    suplaOK ? "OK" : "BRAK"
+    suplaOK ?
+    "OK" :
+    "BRAK"
   );
 
 
-  if (wifiOK && suplaOK) {
+  if (
+    wifiOK &&
+    suplaOK
+  ) {
 
     esp_err_t result =
       esp_ota_mark_app_valid_cancel_rollback();
 
 
-    if (result == ESP_OK) {
+    if (
+      result ==
+      ESP_OK
+    ) {
 
-      otaPendingVerification = false;
+      otaPendingVerification =
+        false;
+
 
       Serial.println();
-      Serial.println("==============================");
-      Serial.println("OTA FIRMWARE VALID");
-      Serial.println("Rollback anulowany");
-      Serial.println("==============================");
+      Serial.println(
+        "=============================="
+      );
+
+      Serial.println(
+        "OTA FIRMWARE VALID"
+      );
+
+      Serial.println(
+        "Rollback anulowany"
+      );
+
+      Serial.println(
+        "=============================="
+      );
     }
+
     else {
 
       Serial.print(
@@ -740,7 +1369,9 @@ void handleRollbackVerification() {
       );
 
       Serial.println(
-        esp_err_to_name(result)
+        esp_err_to_name(
+          result
+        )
       );
     }
   }
@@ -748,27 +1379,33 @@ void handleRollbackVerification() {
 
 
 // =====================================================
-// RECZNE OTA
+// OTA
 // =====================================================
 
 void performOTA() {
 
   if (otaInProgress) {
+
     return;
   }
 
 
-  if (otaPendingVerification) {
+  if (
+    otaPendingVerification
+  ) {
 
     Serial.println(
-      "OTA zablokowane: obecny firmware PENDING_VERIFY"
+      "OTA zablokowane: firmware PENDING_VERIFY"
     );
 
     return;
   }
 
 
-  if (WiFi.status() != WL_CONNECTED) {
+  if (
+    WiFi.status() !=
+    WL_CONNECTED
+  ) {
 
     Serial.println(
       "OTA ERROR: brak WiFi"
@@ -783,29 +1420,51 @@ void performOTA() {
 
 
   Serial.println();
-  Serial.println("==============================");
-  Serial.println("START OTA");
-  Serial.print("Firmware: ");
-  Serial.println(FW_VERSION);
-  Serial.println("==============================");
+  Serial.println(
+    "=============================="
+  );
+
+  Serial.println(
+    "START OTA"
+  );
+
+  Serial.print(
+    "Firmware: "
+  );
+
+  Serial.println(
+    FW_VERSION
+  );
+
+  Serial.println(
+    "=============================="
+  );
 
 
   WiFiClientSecure client;
 
+
+  // Na razie HTTPS bez lokalnej
+  // weryfikacji certyfikatu CA.
   client.setInsecure();
 
 
+  // GitHub Release przekierowuje
+  // do serwera z assetem.
   httpUpdate.setFollowRedirects(
     HTTPC_FORCE_FOLLOW_REDIRECTS
   );
 
-  httpUpdate.rebootOnUpdate(true);
+
+  httpUpdate.rebootOnUpdate(
+    true
+  );
 
 
   httpUpdate.onStart([]() {
 
     Serial.println(
-      "OTA: pobieranie firmware..."
+      "OTA: pobieranie..."
     );
   });
 
@@ -813,22 +1472,40 @@ void performOTA() {
   httpUpdate.onProgress(
     [](int current, int total) {
 
-      if (total <= 0) {
+      if (
+        total <= 0
+      ) {
+
         return;
       }
 
+
       int percent =
-        (current * 100) / total;
+        (current * 100) /
+        total;
 
 
-      if (percent != otaLastProgress &&
-          percent % 10 == 0) {
+      if (
+        percent !=
+          otaLastProgress &&
+        percent % 10 == 0
+      ) {
 
-        otaLastProgress = percent;
+        otaLastProgress =
+          percent;
 
-        Serial.print("OTA: ");
-        Serial.print(percent);
-        Serial.println("%");
+
+        Serial.print(
+          "OTA: "
+        );
+
+        Serial.print(
+          percent
+        );
+
+        Serial.println(
+          "%"
+        );
       }
     }
   );
@@ -846,17 +1523,27 @@ void performOTA() {
   });
 
 
-  httpUpdate.onError([](int error) {
+  httpUpdate.onError(
+    [](int error) {
 
-    Serial.print("OTA ERROR: ");
-    Serial.println(error);
+      Serial.print(
+        "OTA ERROR: "
+      );
 
-    Serial.print("Opis: ");
+      Serial.println(
+        error
+      );
 
-    Serial.println(
-      httpUpdate.getLastErrorString()
-    );
-  });
+
+      Serial.print(
+        "Opis: "
+      );
+
+      Serial.println(
+        httpUpdate.getLastErrorString()
+      );
+    }
+  );
 
 
   t_httpUpdate_return result =
@@ -866,7 +1553,10 @@ void performOTA() {
     );
 
 
-  if (result == HTTP_UPDATE_FAILED) {
+  if (
+    result ==
+    HTTP_UPDATE_FAILED
+  ) {
 
     Serial.println(
       "OTA zakonczone bledem"
@@ -874,7 +1564,9 @@ void performOTA() {
   }
 
   else if (
-    result == HTTP_UPDATE_NO_UPDATES) {
+    result ==
+    HTTP_UPDATE_NO_UPDATES
+  ) {
 
     Serial.println(
       "OTA: brak aktualizacji"
@@ -882,7 +1574,9 @@ void performOTA() {
   }
 
   else if (
-    result == HTTP_UPDATE_OK) {
+    result ==
+    HTTP_UPDATE_OK
+  ) {
 
     Serial.println(
       "OTA OK"
@@ -895,57 +1589,163 @@ void performOTA() {
 
 
 // =====================================================
-// SETUP
+// CZYTELNY STATUS SUPLA
 // =====================================================
 
-void setup() {
+const char *getSuplaStatusText(
+  int status
+) {
 
-  Serial.begin(115200);
+  switch (status) {
 
-  delay(1000);
+    case STATUS_INITIALIZED:
+      return "INITIALIZED";
+
+    case STATUS_SERVER_DISCONNECTED:
+      return "SERVER DISCONNECTED";
+
+    case STATUS_NETWORK_DISCONNECTED:
+      return "NETWORK DISCONNECTED";
+
+    case STATUS_REGISTER_IN_PROGRESS:
+      return "REGISTERING";
+
+    case STATUS_REGISTERED_AND_READY:
+      return "READY";
+
+    case STATUS_BAD_CREDENTIALS:
+      return "BAD CREDENTIALS";
+
+    case STATUS_MISSING_CREDENTIALS:
+      return "MISSING CREDENTIALS";
+
+    case STATUS_INVALID_AUTHKEY:
+      return "INVALID AUTHKEY";
+
+    case STATUS_CONFIG_MODE:
+      return "CONFIG MODE";
+
+    default:
+      return "OTHER";
+  }
+}
 
 
-  Serial.println();
-  Serial.println("==============================");
-  Serial.println("Mitsubishi MelcoBEMS SUPLA");
-  Serial.print("Firmware: ");
-  Serial.println(FW_VERSION);
-  Serial.println("==============================");
+// =====================================================
+// DIAGNOSTYKA WIFI + SUPLA
+// drukuje tylko po zmianie
+// =====================================================
+
+void handleDiagnostics() {
+
+  if (
+    millis() -
+      lastDiagnosticsCheck <
+    1000
+  ) {
+
+    return;
+  }
 
 
-  // -------------------------------------------------
-  // MODBUS
-  // -------------------------------------------------
-
-  RS485.begin(
-    MODBUS_BAUD,
-    SERIAL_8N1,
-    RS485_RX,
-    RS485_TX
-  );
-
-  node.begin(
-    MODBUS_SLAVE_ID,
-    RS485
-  );
+  lastDiagnosticsCheck =
+    millis();
 
 
-  // -------------------------------------------------
-  // WWW SUPLA
-  // -------------------------------------------------
+  int wifiStatus =
+    WiFi.status();
 
-  new Supla::Html::DeviceInfo(
-    &SuplaDevice
-  );
 
-  new Supla::Html::WifiParameters;
+  int suplaStatus =
+    SuplaDevice.getCurrentStatus();
 
-  new Supla::Html::ProtocolParameters;
+
+  if (
+    wifiStatus !=
+    lastWifiStatus
+  ) {
+
+    lastWifiStatus =
+      wifiStatus;
+
+
+    Serial.print(
+      "WiFi status: "
+    );
+
+    Serial.println(
+      wifiStatus
+    );
+
+
+    if (
+      wifiStatus ==
+      WL_CONNECTED
+    ) {
+
+      Serial.print(
+        "IP: "
+      );
+
+      Serial.println(
+        WiFi.localIP()
+      );
+
+
+      Serial.print(
+        "RSSI: "
+      );
+
+      Serial.print(
+        WiFi.RSSI()
+      );
+
+      Serial.println(
+        " dBm"
+      );
+    }
+  }
+
+
+  if (
+    suplaStatus !=
+    lastSuplaStatus
+  ) {
+
+    lastSuplaStatus =
+      suplaStatus;
+
+
+    Serial.print(
+      "SUPLA status: "
+    );
+
+    Serial.print(
+      suplaStatus
+    );
+
+    Serial.print(
+      " - "
+    );
+
+    Serial.println(
+      getSuplaStatusText(
+        suplaStatus
+      )
+    );
+  }
+}
+
+
+// =====================================================
+// TWORZENIE KANALOW
+// =====================================================
+
+void createSuplaChannels() {
 
 
   // =================================================
-  // KANAL 0
-  // Temperatura zewnetrzna
+  // 0 - Temperatura zewnetrzna
   // =================================================
 
   outdoorTemp =
@@ -957,8 +1757,7 @@ void setup() {
 
 
   // =================================================
-  // KANAL 1
-  // Temperatura zasilania
+  // 1 - Temperatura zasilania
   // =================================================
 
   flowTemp =
@@ -970,8 +1769,7 @@ void setup() {
 
 
   // =================================================
-  // KANAL 2
-  // Temperatura powrotu
+  // 2 - Temperatura powrotu
   // =================================================
 
   returnTemp =
@@ -983,8 +1781,7 @@ void setup() {
 
 
   // =================================================
-  // KANAL 3
-  // Czestotliwosc HP
+  // 3 - Czestotliwosc HP
   // =================================================
 
   hpFrequency =
@@ -998,12 +1795,13 @@ void setup() {
     "Hz"
   );
 
-  hpFrequency->setDefaultValuePrecision(0);
+  hpFrequency->setDefaultValuePrecision(
+    0
+  );
 
 
   // =================================================
-  // KANAL 4
-  // Praca pompy ciepla
+  // 4 - Praca pompy ciepla
   // =================================================
 
   hpRunning =
@@ -1015,8 +1813,7 @@ void setup() {
 
 
   // =================================================
-  // KANAL 5
-  // Kod bledu
+  // 5 - Kod bledu
   // =================================================
 
   faultCode =
@@ -1026,12 +1823,13 @@ void setup() {
     "Kod bledu"
   );
 
-  faultCode->setDefaultValuePrecision(0);
+  faultCode->setDefaultValuePrecision(
+    0
+  );
 
 
   // =================================================
-  // KANAL 6
-  // Firmware A1M
+  // 6 - Firmware MelcoBEMS
   // =================================================
 
   firmwareA1M =
@@ -1041,12 +1839,13 @@ void setup() {
     "Firmware MelcoBEMS"
   );
 
-  firmwareA1M->setDefaultValuePrecision(0);
+  firmwareA1M->setDefaultValuePrecision(
+    0
+  );
 
 
   // =================================================
-  // KANAL 7
-  // Licznik Modbus
+  // 7 - Licznik Modbus
   // =================================================
 
   modbusCounter =
@@ -1056,12 +1855,13 @@ void setup() {
     "Licznik Modbus"
   );
 
-  modbusCounter->setDefaultValuePrecision(0);
+  modbusCounter->setDefaultValuePrecision(
+    0
+  );
 
 
   // =================================================
-  // KANAL 8
-  // Typ systemu
+  // 8 - Typ systemu
   // =================================================
 
   systemType =
@@ -1071,12 +1871,13 @@ void setup() {
     "Typ systemu"
   );
 
-  systemType->setDefaultValuePrecision(0);
+  systemType->setDefaultValuePrecision(
+    0
+  );
 
 
   // =================================================
-  // KANAL 9
-  // OTA
+  // 9 - Aktualizacja OTA
   // =================================================
 
   otaTrigger =
@@ -1094,8 +1895,7 @@ void setup() {
 
 
   // =================================================
-  // KANAL 10
-  // Odszranianie
+  // 10 - Odszranianie
   // =================================================
 
   defrostStatus =
@@ -1105,12 +1905,13 @@ void setup() {
     "Odszranianie"
   );
 
-  defrostStatus->setDefaultValuePrecision(0);
+  defrostStatus->setDefaultValuePrecision(
+    0
+  );
 
 
   // =================================================
-  // KANAL 11
-  // Tryb pracy
+  // 11 - Tryb pracy
   // =================================================
 
   operatingMode =
@@ -1120,32 +1921,138 @@ void setup() {
     "Tryb pracy"
   );
 
-  operatingMode->setDefaultValuePrecision(0);
+  operatingMode->setDefaultValuePrecision(
+    0
+  );
 
 
-  // -------------------------------------------------
+  // =================================================
+  // 12 - Komunikacja Modbus
+  // =================================================
+
+  modbusStatus =
+    new Supla::Sensor::VirtualBinary();
+
+  modbusStatus->setInitialCaption(
+    "Komunikacja Modbus"
+  );
+
+  modbusStatus->clear();
+}
+
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  Serial.begin(
+    115200
+  );
+
+
+  delay(
+    1000
+  );
+
+
+  Serial.println();
+  Serial.println(
+    "=============================="
+  );
+
+  Serial.println(
+    "Mitsubishi MelcoBEMS SUPLA"
+  );
+
+  Serial.print(
+    "Firmware: "
+  );
+
+  Serial.println(
+    FW_VERSION
+  );
+
+  Serial.println(
+    "=============================="
+  );
+
+
+  // =================================================
+  // MODBUS
+  // =================================================
+
+  RS485.begin(
+    MODBUS_BAUD,
+    SERIAL_8N1,
+    RS485_RX,
+    RS485_TX
+  );
+
+
+  node.begin(
+    MODBUS_SLAVE_ID,
+    RS485
+  );
+
+
+  // Kluczowa rzecz:
+  // podczas oczekiwania Modbus obslugujemy SUPLA.
+  node.idle(
+    modbusIdle
+  );
+
+
+  // =================================================
+  // SUPLA WWW
+  // =================================================
+
+  new Supla::Html::DeviceInfo(
+    &SuplaDevice
+  );
+
+  new Supla::Html::WifiParameters;
+
+  new Supla::Html::ProtocolParameters;
+
+
+  // =================================================
+  // KANALY
+  // =================================================
+
+  createSuplaChannels();
+
+
+  // =================================================
   // DEVICE
-  // -------------------------------------------------
+  // =================================================
 
   SuplaDevice.setName(
     "Mitsubishi MelcoBEMS"
   );
 
+
   SuplaDevice.setSwVersion(
     FW_VERSION
   );
+
 
   SuplaDevice.setInitialMode(
     Supla::InitialMode::StartInCfgMode
   );
 
 
+  // =================================================
+  // START
+  // =================================================
+
   SuplaDevice.begin();
 
 
-  // -------------------------------------------------
+  // =================================================
   // ROLLBACK
-  // -------------------------------------------------
+  // =================================================
 
   initRollbackState();
 
@@ -1157,6 +2064,11 @@ void setup() {
   Serial.println(
     ESP.getFreeSketchSpace()
   );
+
+
+  Serial.println(
+    "Start schedulera Modbus"
+  );
 }
 
 
@@ -1166,29 +2078,31 @@ void setup() {
 
 void loop() {
 
+
+  // SUPLA zawsze ma najwyzszy priorytet.
   SuplaDevice.iterate();
 
 
-  // -------------------------------------------------
-  // Rollback
-  // -------------------------------------------------
+  // Czytelny debug WiFi/SUPLA.
+  handleDiagnostics();
 
+
+  // Walidacja firmware po OTA.
   handleRollbackVerification();
 
 
-  // -------------------------------------------------
-  // Historia + status text hack
-  // -------------------------------------------------
-
+  // Historia + teksty statusow GPM.
   updateStatusDescriptions();
 
 
-  // -------------------------------------------------
-  // OTA z SUPLA
-  // -------------------------------------------------
+  // =================================================
+  // OTA Z SUPLA
+  // =================================================
 
-  if (otaTrigger->isOn() &&
-      !otaInProgress) {
+  if (
+    otaTrigger->isOn() &&
+    !otaInProgress
+  ) {
 
     Serial.println();
     Serial.println(
@@ -1196,56 +2110,25 @@ void loop() {
     );
 
 
-    // Przycisk zachowuje sie chwilowo.
+    // Zachowuje sie jak przycisk.
     otaTrigger->turnOff();
+
 
     SuplaDevice.iterate();
 
-    delay(250);
+
+    delay(
+      250
+    );
 
 
     performOTA();
   }
 
 
-  // -------------------------------------------------
-  // FAST MODBUS
-  // -------------------------------------------------
+  // =================================================
+  // MODBUS
+  // =================================================
 
-  if (!otaInProgress &&
-      millis() - lastFastPoll >=
-      FAST_POLL_INTERVAL) {
-
-    lastFastPoll = millis();
-
-    readFastModbus();
-  }
-
-
-  // -------------------------------------------------
-  // SLOW MODBUS
-  //
-  // pierwszy raz po ok. 10 s,
-  // potem co 60 s
-  // -------------------------------------------------
-
-  if (!otaInProgress) {
-
-    if (
-      (firstSlowPoll &&
-       millis() >= 10000)
-
-      ||
-
-      (!firstSlowPoll &&
-       millis() - lastSlowPoll >=
-       SLOW_POLL_INTERVAL)
-    ) {
-
-      firstSlowPoll = false;
-      lastSlowPoll = millis();
-
-      readSlowModbus();
-    }
-  }
+  handleModbusScheduler();
 }
