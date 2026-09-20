@@ -147,7 +147,7 @@ enum RegisterType {
   REG_SYSTEM_TYPE
 };
 
-void applyRegisterValue(RegisterType type, uint16_t raw);
+void applyRegisterValue(uint8_t type, uint16_t raw);
 
 struct ModbusPollItem {
   uint16_t address;
@@ -480,7 +480,7 @@ const char *getSystemTypeText(
 // =====================================================
 
 void applyRegisterValue(
-  RegisterType type,
+  uint8_t type,
   uint16_t raw
 ) {
 
