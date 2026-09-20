@@ -1573,7 +1573,7 @@ void namePumpChannel(Supla::Element *element, uint8_t pump,
   element->setInitialCaption(caption.c_str());
 }
 
-void numberChannel(Supla::ChannelElement *element, uint8_t number) {
+void numberChannel(Supla::Element *element, uint8_t number) {
   if (!element->getChannel()->setChannelNumber(number)) {
     Serial.print("Nie mozna przypisac kanalu SUPLA nr ");
     Serial.println(number);
