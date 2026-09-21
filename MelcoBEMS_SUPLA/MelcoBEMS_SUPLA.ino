@@ -14,6 +14,7 @@
 #include <supla/sensor/virtual_binary.h>
 #include <supla/control/virtual_relay.h>
 #include <supla/control/relay.h>
+#include <supla/control/button.h>
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -31,7 +32,7 @@
 // WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.13"
+#define FW_VERSION "1.0.14"
 
 
 // =====================================================
@@ -90,6 +91,8 @@ const uint8_t DS_SENSOR_COUNT = 8;
 const uint8_t DS_DATA_PIN = 4;
 const uint8_t RELAY_COUNT = 5;
 const uint8_t RELAY_PINS[RELAY_COUNT] = {1, 2, 41, 42, 45};
+const uint8_t BOOT_BUTTON_PIN = 0;
+const uint32_t BOOT_BUTTON_HOLD_MS = 5000;
 const double TANK_VOLUME_LITERS = 1000.0;
 const double CWU_COLD_REFERENCE_C = 10.0;
 const unsigned long DS_READ_INTERVAL = 15000;
@@ -2122,6 +2125,15 @@ void setup() {
   delay(
     1000
   );
+
+  // BOOT (GPIO 0): przytrzymanie po uruchomieniu wlacza AP konfiguracji.
+  // Krotkie nacisniecie nie wykonuje zadnej akcji i nie kasuje ustawien.
+  auto configButton = new Supla::Control::Button(
+    BOOT_BUTTON_PIN, true, true);
+  configButton->dontUseOnLoadConfig();
+  configButton->setHoldTime(BOOT_BUTTON_HOLD_MS);
+  configButton->addAction(
+    Supla::ENTER_CONFIG_MODE, &SuplaDevice, Supla::ON_HOLD, true);
 
 
   Serial.println();

@@ -1,6 +1,6 @@
 # Rejestry Modbus w firmware
 
-Stan mapowania: firmware 1.0.13 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
+Stan mapowania: firmware 1.0.14 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
 Adresy ponizej to adresy przekazywane wprost do `readHoldingRegisters(adres, 1)`
 (adresowanie od zera w ramce Modbus), a nie numeracja 4xxxx z niektorych
 programow. Jezeli program konfiguracyjny numeruje rejestry od 1, sprawdz jego
