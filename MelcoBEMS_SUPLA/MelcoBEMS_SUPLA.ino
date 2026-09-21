@@ -193,20 +193,18 @@ class HeatingEcoRelay : public Supla::Control::VirtualRelay {
         mode != OPERATING_MODE_HEATING_ECO) return;
 
     confirmedEco = mode == OPERATING_MODE_HEATING_ECO;
-    confirmedKnown = true;
     if (!commandPending) setDisplayedState(confirmedEco);
   }
 
   void confirmCommand() {
     confirmedEco = desiredEco;
-    confirmedKnown = true;
     commandPending = false;
     setDisplayedState(confirmedEco);
   }
 
   void rejectCommand() {
     commandPending = false;
-    setDisplayedState(confirmedKnown ? confirmedEco : false);
+    setDisplayedState(confirmedEco);
   }
 
  private:
@@ -221,8 +219,7 @@ class HeatingEcoRelay : public Supla::Control::VirtualRelay {
 
   bool commandPending = false;
   bool desiredEco = false;
-  bool confirmedKnown = false;
-  bool confirmedEco = false;
+  bool confirmedEco = true;
 };
 
 HeatingEcoRelay *heatingEcoControl[CAHV_COUNT] = {};
@@ -2228,13 +2225,13 @@ void createSuplaChannels() {
     channels.compressorRuntime->setDefaultValuePrecision(2);
   }
 
-  // 69-70: zapis HR26 dla CAHV. OFF = Heating, ON = Heating Eco.
+  // 69-70: zapis HR26 dla CAHV. Domyslny widok ON nie wysyla zapisu.
   for (uint8_t pump = 0; pump < CAHV_COUNT; pump++) {
     heatingEcoControl[pump] = new HeatingEcoRelay();
     numberChannel(heatingEcoControl[pump], 69 + pump);
     namePumpChannel(heatingEcoControl[pump], pump, "Heating Eco");
     heatingEcoControl[pump]->setDefaultFunction(SUPLA_CHANNELFNC_POWERSWITCH);
-    heatingEcoControl[pump]->setDefaultStateOff();
+    heatingEcoControl[pump]->setDefaultStateOn();
   }
 }
 

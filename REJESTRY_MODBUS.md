@@ -58,7 +58,10 @@ CAHV 1 i CAHV 2:
 Stan przelacznika jest synchronizowany z cyklicznym odczytem HR26. Przy
 braku komunikacji albo bledzie funkcji 06 polecenie jest odrzucane, a kanal
 wraca do ostatniego potwierdzonego stanu. Jezeli HR26 ma inny tryb, np.
-Stop, kanal zachowuje ostatni rozpoznany wybor Heating/Heating Eco.
+Stop, kanal zachowuje ostatni rozpoznany wybor Heating/Heating Eco. Poczatkowy
+stan kanalu to ON (Heating Eco), ale uruchomienie ESP nie wysyla zapisu.
+Kazda zmiana kanalu powoduje tylko jedna probe zapisu; cyklicznie wykonywany
+jest wylacznie odczyt kontrolny HR26.
 
 ## Wartosci pochodne
 
