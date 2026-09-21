@@ -1,6 +1,6 @@
 # Rejestry Modbus w firmware
 
-Stan mapowania: firmware 1.0.14 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
+Stan mapowania: firmware 1.0.15 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
 Adresy ponizej to adresy przekazywane wprost do `readHoldingRegisters(adres, 1)`
 (adresowanie od zera w ramce Modbus), a nie numeracja 4xxxx z niektorych
 programow. Jezeli program konfiguracyjny numeruje rejestry od 1, sprawdz jego
@@ -11,8 +11,8 @@ Kazda pompa jest niezalezna:
 
 | Slave ID | Pompa | Kanaly SUPLA powiazane z pompa |
 | ---: | --- | --- |
-| 1 | CAHV 1 | 0-5, 10-14, 43, 46-47, 66 |
-| 2 | CAHV 2 | 15-20, 24-28, 44, 48-49, 67 |
+| 1 | CAHV 1 | 0-5, 10-14, 43, 46-47, 66, 69 |
+| 2 | CAHV 2 | 15-20, 24-28, 44, 48-49, 67, 70 |
 | 3 | QAHV | 29-34, 38-42, 45, 50-51, 68 |
 
 Wszystkie wpisy w tabeli sa **odczytami holding register, funkcja 03**.
@@ -45,6 +45,21 @@ Kody prezentowane przez firmware: odszranianie (67): `0` Normal, `1` Standby,
 Kod bledu (9): `0x8000` jest opisywany jako OK, `0x6999` jako Comm error,
 pozostale wartosci jako Fault; surowa liczba pozostaje widoczna w kanale.
 
+## Sterowanie trybem CAHV
+
+Kanaly SUPLA 69 i 70 zapisuja rejestr 26 funkcja Modbus 06 odpowiednio do
+CAHV 1 i CAHV 2:
+
+| Kanal SUPLA | Pompa | OFF | ON |
+| ---: | --- | --- | --- |
+| 69 | CAHV 1, slave 1 | `HR26 = 2` (Heating) | `HR26 = 7` (Heating Eco) |
+| 70 | CAHV 2, slave 2 | `HR26 = 2` (Heating) | `HR26 = 7` (Heating Eco) |
+
+Stan przelacznika jest synchronizowany z cyklicznym odczytem HR26. Przy
+braku komunikacji albo bledzie funkcji 06 polecenie jest odrzucane, a kanal
+wraca do ostatniego potwierdzonego stanu. Jezeli HR26 ma inny tryb, np.
+Stop, kanal zachowuje ostatni rozpoznany wybor Heating/Heating Eco.
+
 ## Wartosci pochodne
 
 Te kanaly **nie sa osobnymi rejestrami Modbus**:
@@ -67,5 +82,5 @@ ale **nie sa juz odpytywane**. Mozna je ukryc w SUPLA Cloud.
 
 Pozostale kanaly nie pochodza z Modbus: 9 uruchamia OTA, 52-59 to osiem
 czujnikow DS18B20, 60 to szacowana energia CWU, a 61-65 steruja piecioma
-lokalnymi przekaznikami. W tym firmware nie ma zapisu do rejestrow pomp;
-przelaczenie przekaznikow 64 i 65 nie wysyla ramki zapisu Modbus.
+lokalnymi przekaznikami. Przelaczenie fizycznych przekaznikow 64 i 65 nadal
+nie wysyla ramki Modbus; zapis HR26 realizuja wylacznie kanaly 69 i 70.

@@ -32,7 +32,7 @@
 // WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.14"
+#define FW_VERSION "1.0.15"
 
 
 // =====================================================
@@ -79,8 +79,12 @@ extern "C" bool verifyRollbackLater() {
 #define MODBUS_BAUD 9600
 
 const uint8_t PUMP_COUNT = 3;
+const uint8_t CAHV_COUNT = 2;
 const uint8_t PUMP_SLAVE_IDS[PUMP_COUNT] = {1, 2, 3};
 const char *const PUMP_NAMES[PUMP_COUNT] = {"CAHV 1", "CAHV 2", "QAHV"};
+const uint16_t OPERATING_MODE_REGISTER = 26;
+const uint16_t OPERATING_MODE_HEATING = 2;
+const uint16_t OPERATING_MODE_HEATING_ECO = 7;
 
 HardwareSerial RS485(1);
 ModbusMaster node;
@@ -165,6 +169,64 @@ Supla::Sensor::GeneralPurposeMeasurement *systemType;
 // 9
 Supla::Control::VirtualRelay *otaTrigger;
 
+class HeatingEcoRelay : public Supla::Control::VirtualRelay {
+ public:
+  int32_t handleNewValueFromServer(
+      TSD_SuplaChannelNewValue *newValue) override {
+    if (newValue == nullptr || newValue->value[0] > 1) return -1;
+
+    desiredEco = newValue->value[0] == 1;
+    commandPending = true;
+    return Supla::Control::VirtualRelay::handleNewValueFromServer(newValue);
+  }
+
+  bool hasPendingCommand() const {
+    return commandPending;
+  }
+
+  bool getDesiredEco() const {
+    return desiredEco;
+  }
+
+  void syncFromOperatingMode(uint16_t mode) {
+    if (mode != OPERATING_MODE_HEATING &&
+        mode != OPERATING_MODE_HEATING_ECO) return;
+
+    confirmedEco = mode == OPERATING_MODE_HEATING_ECO;
+    confirmedKnown = true;
+    if (!commandPending) setDisplayedState(confirmedEco);
+  }
+
+  void confirmCommand() {
+    confirmedEco = desiredEco;
+    confirmedKnown = true;
+    commandPending = false;
+    setDisplayedState(confirmedEco);
+  }
+
+  void rejectCommand() {
+    commandPending = false;
+    setDisplayedState(confirmedKnown ? confirmedEco : false);
+  }
+
+ private:
+  void setDisplayedState(bool eco) {
+    if (eco == isOn()) return;
+    if (eco) {
+      turnOn();
+    } else {
+      turnOff();
+    }
+  }
+
+  bool commandPending = false;
+  bool desiredEco = false;
+  bool confirmedKnown = false;
+  bool confirmedEco = false;
+};
+
+HeatingEcoRelay *heatingEcoControl[CAHV_COUNT] = {};
+
 // 10
 Supla::Sensor::GeneralPurposeMeasurement *defrostStatus;
 
@@ -243,7 +305,7 @@ ModbusPollItem pollItems[] = {
   {73,  5000, {0}, REG_FREQUENCY, ALL_PUMPS},
   {127, 5000, {0}, REG_HP_RUNNING, ALL_PUMPS},
   {67,  5000, {0}, REG_DEFROST, ALL_PUMPS},
-  {26,  5000, {0}, REG_OPERATING_MODE, ALL_PUMPS},
+  {OPERATING_MODE_REGISTER, 5000, {0}, REG_OPERATING_MODE, ALL_PUMPS},
   {9,   5000, {0}, REG_FAULT, ALL_PUMPS},
   {85,  5000, {0}, REG_FLOW_SETPOINT, ALL_PUMPS},
   {25,  5000, {0}, REG_SYSTEM_ON, ALL_PUMPS},
@@ -491,6 +553,22 @@ bool readHR(
 
   lastModbusError[pump] = result;
 
+  return false;
+}
+
+
+bool writeHR(
+  uint8_t pump,
+  uint16_t address,
+  uint16_t value
+) {
+
+  node.begin(PUMP_SLAVE_IDS[pump], RS485);
+
+  uint8_t result = node.writeSingleRegister(address, value);
+  if (result == node.ku8MBSuccess) return true;
+
+  lastModbusError[pump] = result;
   return false;
 }
 
@@ -796,6 +874,10 @@ void applyRegisterValue(
       state.operatingMode = raw;
       state.haveOperatingMode = true;
 
+      if (pump < CAHV_COUNT && heatingEcoControl[pump] != nullptr) {
+        heatingEcoControl[pump]->syncFromOperatingMode(raw);
+      }
+
 
       break;
     }
@@ -942,6 +1024,48 @@ void handleModbusScheduler() {
       }
       return;
     }
+  }
+}
+
+
+void handleHeatingEcoControls() {
+  for (uint8_t pump = 0; pump < CAHV_COUNT; pump++) {
+    HeatingEcoRelay *control = heatingEcoControl[pump];
+    if (control == nullptr || !control->hasPendingCommand()) continue;
+
+    PumpState &state = pumpState[pump];
+    if (!state.stateKnown || !state.online) {
+      Serial.print("MODBUS slave ");
+      Serial.print(PUMP_SLAVE_IDS[pump]);
+      Serial.println(": odrzucono zmiane trybu - brak komunikacji");
+      control->rejectCommand();
+      continue;
+    }
+
+    unsigned long now = millis();
+    if (now - lastModbusTransaction < MODBUS_MIN_GAP) return;
+
+    bool eco = control->getDesiredEco();
+    uint16_t mode = eco ? OPERATING_MODE_HEATING_ECO
+                        : OPERATING_MODE_HEATING;
+    bool ok = writeHR(pump, OPERATING_MODE_REGISTER, mode);
+    lastModbusTransaction = millis();
+
+    Serial.print("MODBUS slave ");
+    Serial.print(PUMP_SLAVE_IDS[pump]);
+    if (ok) {
+      Serial.print(": ustawiono HR26 = ");
+      Serial.print(mode);
+      Serial.println(eco ? " (Heating Eco)" : " (Heating)");
+      applyRegisterValue(pump, REG_OPERATING_MODE, mode);
+      control->confirmCommand();
+    } else {
+      Serial.print(": blad zapisu HR26, kod 0x");
+      Serial.println(lastModbusError[pump], HEX);
+      control->rejectCommand();
+    }
+
+    return;
   }
 }
 
@@ -2103,6 +2227,15 @@ void createSuplaChannels() {
     channels.compressorRuntime->setDefaultUnitAfterValue("h");
     channels.compressorRuntime->setDefaultValuePrecision(2);
   }
+
+  // 69-70: zapis HR26 dla CAHV. OFF = Heating, ON = Heating Eco.
+  for (uint8_t pump = 0; pump < CAHV_COUNT; pump++) {
+    heatingEcoControl[pump] = new HeatingEcoRelay();
+    numberChannel(heatingEcoControl[pump], 69 + pump);
+    namePumpChannel(heatingEcoControl[pump], pump, "Heating Eco");
+    heatingEcoControl[pump]->setDefaultFunction(SUPLA_CHANNELFNC_POWERSWITCH);
+    heatingEcoControl[pump]->setDefaultStateOff();
+  }
 }
 
 
@@ -2322,6 +2455,7 @@ void loop() {
   // =================================================
 
   handleDsSensors();
+  handleHeatingEcoControls();
   handleModbusScheduler();
   for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
     updateCompressorRuntime(pump);
