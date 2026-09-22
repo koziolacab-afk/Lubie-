@@ -1,6 +1,6 @@
 # Rejestry Modbus w firmware
 
-Stan mapowania: firmware 1.0.16 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
+Stan mapowania: firmware 1.0.17 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
 Adresy ponizej to adresy przekazywane wprost do `readHoldingRegisters(adres, 1)`
 (adresowanie od zera w ramce Modbus), a nie numeracja 4xxxx z niektorych
 programow. Jezeli program konfiguracyjny numeruje rejestry od 1, sprawdz jego
@@ -78,7 +78,8 @@ Uruchomienie ESP, cykliczny odczyt ani synchronizacja z SUPLA nie wysylaja
 zapisu. Po bledzie komunikacji suwak wraca do ostatniej odczytanej wartosci.
 Po udanym zapisie firmware zleca kontrolny odczyt HR30. Rzeczywista wartosc
 odczytana z QAHV pozostaje w osobnym kanale termometru 45 (`QAHV Temperatura
-Thermo-off`).
+Thermo-off`). Kanal udostepnia konfiguracje harmonogramu wymagana przez
+aplikacje mobilna SUPLA, ale wybranie trybu Program nie zapisuje HR30.
 
 ## Wartosci pochodne
 

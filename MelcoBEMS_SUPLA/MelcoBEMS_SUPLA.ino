@@ -33,7 +33,7 @@
 // WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.16"
+#define FW_VERSION "1.0.17"
 
 
 // =====================================================
@@ -236,7 +236,6 @@ class QahvThermoOffControl : public Supla::Control::HvacBase {
     enableDomesticHotWaterFunctionSupport();
     getChannel()->setDefaultFunction(
       SUPLA_CHANNELFNC_HVAC_DOMESTIC_HOT_WATER);
-    getChannel()->unsetFlag(SUPLA_CHANNEL_FLAG_WEEKLY_SCHEDULE);
     getChannel()->unsetFlag(SUPLA_CHANNEL_FLAG_COUNTDOWN_TIMER_SUPPORTED);
     setDefaultTemperatureRoomMin(
       SUPLA_CHANNELFNC_HVAC_DOMESTIC_HOT_WATER, THERMO_OFF_MIN_RAW);
