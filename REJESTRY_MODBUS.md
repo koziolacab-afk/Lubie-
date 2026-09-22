@@ -1,6 +1,6 @@
 # Rejestry Modbus w firmware
 
-Stan mapowania: firmware 1.0.15 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
+Stan mapowania: firmware 1.0.16 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
 Adresy ponizej to adresy przekazywane wprost do `readHoldingRegisters(adres, 1)`
 (adresowanie od zera w ramce Modbus), a nie numeracja 4xxxx z niektorych
 programow. Jezeli program konfiguracyjny numeruje rejestry od 1, sprawdz jego
@@ -13,7 +13,7 @@ Kazda pompa jest niezalezna:
 | ---: | --- | --- |
 | 1 | CAHV 1 | 0-5, 10-14, 43, 46-47, 66, 69 |
 | 2 | CAHV 2 | 15-20, 24-28, 44, 48-49, 67, 70 |
-| 3 | QAHV | 29-34, 38-42, 45, 50-51, 68 |
+| 3 | QAHV | 29-34, 38-42, 45, 50-51, 68, 71 |
 
 Wszystkie wpisy w tabeli sa **odczytami holding register, funkcja 03**.
 Interwal jest celem harmonogramu dla kazdej pompy osobno; rzeczywista
@@ -62,6 +62,23 @@ Stop, kanal zachowuje ostatni rozpoznany wybor Heating/Heating Eco. Poczatkowy
 stan kanalu to ON (Heating Eco), ale uruchomienie ESP nie wysyla zapisu.
 Kazda zmiana kanalu powoduje tylko jedna probe zapisu; cyklicznie wykonywany
 jest wylacznie odczyt kontrolny HR26.
+
+## Sterowanie temperatura Thermo-off QAHV
+
+Kanal SUPLA 71 (`QAHV Ustaw Thermo-off`) jest suwakiem temperatury CWU.
+Akceptuje zakres 40,0-90,0 C i zaokragla nastawy do kroku 0,5 C. Po zmianie
+suwaka firmware czeka 1 s na zakonczenie regulacji i wykonuje tylko jedna probe
+zapisu funkcja Modbus 06:
+
+| Kanal SUPLA | Pompa | Zapis |
+| ---: | --- | --- |
+| 71 | QAHV, slave 3 | `HR30 = temperatura C * 100` |
+
+Uruchomienie ESP, cykliczny odczyt ani synchronizacja z SUPLA nie wysylaja
+zapisu. Po bledzie komunikacji suwak wraca do ostatniej odczytanej wartosci.
+Po udanym zapisie firmware zleca kontrolny odczyt HR30. Rzeczywista wartosc
+odczytana z QAHV pozostaje w osobnym kanale termometru 45 (`QAHV Temperatura
+Thermo-off`).
 
 ## Wartosci pochodne
 

@@ -13,6 +13,7 @@
 #include <supla/sensor/general_purpose_measurement.h>
 #include <supla/sensor/virtual_binary.h>
 #include <supla/control/virtual_relay.h>
+#include <supla/control/hvac_base.h>
 #include <supla/control/relay.h>
 #include <supla/control/button.h>
 
@@ -32,7 +33,7 @@
 // WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.15"
+#define FW_VERSION "1.0.16"
 
 
 // =====================================================
@@ -85,6 +86,11 @@ const char *const PUMP_NAMES[PUMP_COUNT] = {"CAHV 1", "CAHV 2", "QAHV"};
 const uint16_t OPERATING_MODE_REGISTER = 26;
 const uint16_t OPERATING_MODE_HEATING = 2;
 const uint16_t OPERATING_MODE_HEATING_ECO = 7;
+const uint16_t THERMO_OFF_REGISTER = 30;
+const int16_t THERMO_OFF_MIN_RAW = 4000;
+const int16_t THERMO_OFF_MAX_RAW = 9000;
+const int16_t THERMO_OFF_STEP_RAW = 50;
+const unsigned long THERMO_OFF_COMMAND_DELAY = 1000;
 
 HardwareSerial RS485(1);
 ModbusMaster node;
@@ -224,6 +230,91 @@ class HeatingEcoRelay : public Supla::Control::VirtualRelay {
 
 HeatingEcoRelay *heatingEcoControl[CAHV_COUNT] = {};
 
+class QahvThermoOffControl : public Supla::Control::HvacBase {
+ public:
+  QahvThermoOffControl() : Supla::Control::HvacBase(nullptr) {
+    enableDomesticHotWaterFunctionSupport();
+    getChannel()->setDefaultFunction(
+      SUPLA_CHANNELFNC_HVAC_DOMESTIC_HOT_WATER);
+    getChannel()->unsetFlag(SUPLA_CHANNEL_FLAG_WEEKLY_SCHEDULE);
+    getChannel()->unsetFlag(SUPLA_CHANNEL_FLAG_COUNTDOWN_TIMER_SUPPORTED);
+    setDefaultTemperatureRoomMin(
+      SUPLA_CHANNELFNC_HVAC_DOMESTIC_HOT_WATER, THERMO_OFF_MIN_RAW);
+    setDefaultTemperatureRoomMax(
+      SUPLA_CHANNELFNC_HVAC_DOMESTIC_HOT_WATER, THERMO_OFF_MAX_RAW);
+    setTemperatureRoomMin(THERMO_OFF_MIN_RAW);
+    setTemperatureRoomMax(THERMO_OFF_MAX_RAW);
+    setButtonTemperatureStep(THERMO_OFF_STEP_RAW);
+  }
+
+  int32_t handleNewValueFromServer(
+      TSD_SuplaChannelNewValue *newValue) override {
+    if (newValue == nullptr) return -1;
+
+    TSD_SuplaChannelNewValue normalized = *newValue;
+    THVACValue *value =
+      reinterpret_cast<THVACValue *>(normalized.value);
+    bool hasSetpoint =
+      Supla::Channel::isHvacFlagSetpointTemperatureHeatSet(value);
+
+    normalized.DurationSec = 0;
+    value->Mode = SUPLA_HVAC_MODE_HEAT;
+
+    if (hasSetpoint) {
+      int32_t requested = value->SetpointTemperatureHeat;
+      if (requested < THERMO_OFF_MIN_RAW) requested = THERMO_OFF_MIN_RAW;
+      if (requested > THERMO_OFF_MAX_RAW) requested = THERMO_OFF_MAX_RAW;
+      requested = ((requested + THERMO_OFF_STEP_RAW / 2) /
+                   THERMO_OFF_STEP_RAW) * THERMO_OFF_STEP_RAW;
+
+      desiredRaw = static_cast<int16_t>(requested);
+      value->SetpointTemperatureHeat = desiredRaw;
+      commandPending = !confirmedKnown || desiredRaw != confirmedRaw;
+      commandQueuedAt = millis();
+    }
+
+    return Supla::Control::HvacBase::handleNewValueFromServer(&normalized);
+  }
+
+  void syncFromRegister(int16_t raw) {
+    if (raw < THERMO_OFF_MIN_RAW || raw > THERMO_OFF_MAX_RAW) return;
+
+    confirmedRaw = raw;
+    confirmedKnown = true;
+    if (!commandPending) setTemperatureSetpointHeat(raw);
+  }
+
+  bool isCommandReady(unsigned long now) const {
+    return commandPending &&
+           now - commandQueuedAt >= THERMO_OFF_COMMAND_DELAY;
+  }
+
+  uint16_t getDesiredRaw() const {
+    return static_cast<uint16_t>(desiredRaw);
+  }
+
+  void confirmCommand() {
+    confirmedRaw = desiredRaw;
+    confirmedKnown = true;
+    commandPending = false;
+    setTemperatureSetpointHeat(confirmedRaw);
+  }
+
+  void rejectCommand() {
+    commandPending = false;
+    if (confirmedKnown) setTemperatureSetpointHeat(confirmedRaw);
+  }
+
+ private:
+  bool commandPending = false;
+  bool confirmedKnown = false;
+  int16_t desiredRaw = 5000;
+  int16_t confirmedRaw = 5000;
+  unsigned long commandQueuedAt = 0;
+};
+
+QahvThermoOffControl *qahvThermoOffControl = nullptr;
+
 // 10
 Supla::Sensor::GeneralPurposeMeasurement *defrostStatus;
 
@@ -309,7 +400,7 @@ ModbusPollItem pollItems[] = {
 
   {136, 60000, {0}, REG_RUNTIME_HOURS, CAHV_PUMPS},
   {137, 60000, {0}, REG_RUNTIME_HUNDREDS, CAHV_PUMPS},
-  {30, 60000, {0}, REG_THERMO_OFF, QAHV_PUMP}
+  {THERMO_OFF_REGISTER, 60000, {0}, REG_THERMO_OFF, QAHV_PUMP}
 };
 
 
@@ -917,6 +1008,9 @@ void applyRegisterValue(
 
     case REG_THERMO_OFF:
       channels.thermoOff->setValue(((int16_t)raw) / 100.0);
+      if (qahvThermoOffControl != nullptr) {
+        qahvThermoOffControl->syncFromRegister((int16_t)raw);
+      }
       break;
   }
 
@@ -1063,6 +1157,46 @@ void handleHeatingEcoControls() {
     }
 
     return;
+  }
+}
+
+
+void handleQahvThermoOffControl() {
+  if (qahvThermoOffControl == nullptr ||
+      !qahvThermoOffControl->isCommandReady(millis())) return;
+
+  const uint8_t pump = 2;
+  PumpState &state = pumpState[pump];
+  if (!state.stateKnown || !state.online) {
+    Serial.println(
+      "MODBUS slave 3: odrzucono Thermo-off - brak komunikacji");
+    qahvThermoOffControl->rejectCommand();
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastModbusTransaction < MODBUS_MIN_GAP) return;
+
+  uint16_t raw = qahvThermoOffControl->getDesiredRaw();
+  bool ok = writeHR(pump, THERMO_OFF_REGISTER, raw);
+  lastModbusTransaction = millis();
+
+  if (ok) {
+    Serial.print("MODBUS slave 3: ustawiono HR30 = ");
+    Serial.print(raw / 100.0, 2);
+    Serial.println(" C");
+    qahvThermoOffControl->confirmCommand();
+
+    for (uint8_t i = 0; i < POLL_ITEM_COUNT; i++) {
+      if (pollItems[i].type == REG_THERMO_OFF) {
+        pollItems[i].lastPoll[pump] = millis() - pollItems[i].interval;
+        break;
+      }
+    }
+  } else {
+    Serial.print("MODBUS slave 3: blad zapisu HR30, kod 0x");
+    Serial.println(lastModbusError[pump], HEX);
+    qahvThermoOffControl->rejectCommand();
   }
 }
 
@@ -2233,6 +2367,12 @@ void createSuplaChannels() {
     heatingEcoControl[pump]->setDefaultFunction(SUPLA_CHANNELFNC_POWERSWITCH);
     heatingEcoControl[pump]->setDefaultStateOn();
   }
+
+  // 71: suwak 40-90 C. Odczyt rzeczywisty pozostaje na kanale 45.
+  qahvThermoOffControl = new QahvThermoOffControl();
+  numberChannel(qahvThermoOffControl, 71);
+  namePumpChannel(qahvThermoOffControl, 2, "Ustaw Thermo-off");
+  qahvThermoOffControl->setMainThermometerChannelNo(45);
 }
 
 
@@ -2452,6 +2592,7 @@ void loop() {
   // =================================================
 
   handleDsSensors();
+  handleQahvThermoOffControl();
   handleHeatingEcoControls();
   handleModbusScheduler();
   for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
