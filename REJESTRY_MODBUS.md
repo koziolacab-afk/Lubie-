@@ -1,6 +1,6 @@
 # Rejestry Modbus w firmware
 
-Stan mapowania: firmware 1.0.17 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
+Stan mapowania: firmware 1.0.18 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
 Adresy ponizej to adresy przekazywane wprost do `readHoldingRegisters(adres, 1)`
 (adresowanie od zera w ramce Modbus), a nie numeracja 4xxxx z niektorych
 programow. Jezeli program konfiguracyjny numeruje rejestry od 1, sprawdz jego
@@ -11,8 +11,8 @@ Kazda pompa jest niezalezna:
 
 | Slave ID | Pompa | Kanaly SUPLA powiazane z pompa |
 | ---: | --- | --- |
-| 1 | CAHV 1 | 0-5, 10-14, 43, 46-47, 66, 69 |
-| 2 | CAHV 2 | 15-20, 24-28, 44, 48-49, 67, 70 |
+| 1 | CAHV 1 | 0-5, 10-14, 43, 46-47, 66, 69, 72 |
+| 2 | CAHV 2 | 15-20, 24-28, 44, 48-49, 67, 70, 73 |
 | 3 | QAHV | 29-34, 38-42, 45, 50-51, 68, 71 |
 
 Wszystkie wpisy w tabeli sa **odczytami holding register, funkcja 03**.
@@ -63,6 +63,22 @@ stan kanalu to ON (Heating Eco), ale uruchomienie ESP nie wysyla zapisu.
 Kazda zmiana kanalu powoduje tylko jedna probe zapisu; cyklicznie wykonywany
 jest wylacznie odczyt kontrolny HR26.
 
+## Sterowanie System ON/OFF CAHV
+
+Kanaly SUPLA 72 i 73 steruja rejestrem 25 funkcja Modbus 06:
+
+| Kanal SUPLA | Pompa | OFF | ON |
+| ---: | --- | --- | --- |
+| 72 | CAHV 1, slave 1 | `HR25 = 0` (System OFF) | `HR25 = 1` (System ON) |
+| 73 | CAHV 2, slave 2 | `HR25 = 0` (System OFF) | `HR25 = 1` (System ON) |
+
+Stan przelacznika jest synchronizowany z cyklicznym odczytem HR25 widocznym
+rowniez w kanalach 14 i 28. Uruchomienie ESP nie wysyla zapisu. Kazda zmiana
+przelacznika powoduje jedna probe zapisu; przy braku komunikacji polecenie jest
+odrzucane, a kanal wraca do ostatniego potwierdzonego stanu. Wartosci HR25 `2`
+(Emergency Run) i `3` (Test Run) sa tylko odczytami i nie zmieniaja polozenia
+przelacznika.
+
 ## Sterowanie temperatura Thermo-off QAHV
 
 Kanal SUPLA 71 (`QAHV Ustaw Thermo-off`) jest suwakiem temperatury CWU.
@@ -104,4 +120,5 @@ ale **nie sa juz odpytywane**. Mozna je ukryc w SUPLA Cloud.
 Pozostale kanaly nie pochodza z Modbus: 9 uruchamia OTA, 52-59 to osiem
 czujnikow DS18B20, 60 to szacowana energia CWU, a 61-65 steruja piecioma
 lokalnymi przekaznikami. Przelaczenie fizycznych przekaznikow 64 i 65 nadal
-nie wysyla ramki Modbus; zapis HR26 realizuja wylacznie kanaly 69 i 70.
+nie wysyla ramki Modbus; zapis HR26 realizuja wylacznie kanaly 69 i 70, a zapis
+HR25 realizuja wylacznie kanaly 72 i 73.

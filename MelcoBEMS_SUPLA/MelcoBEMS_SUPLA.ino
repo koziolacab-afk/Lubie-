@@ -33,7 +33,7 @@
 // WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.17"
+#define FW_VERSION "1.0.18"
 
 
 // =====================================================
@@ -83,6 +83,7 @@ const uint8_t PUMP_COUNT = 3;
 const uint8_t CAHV_COUNT = 2;
 const uint8_t PUMP_SLAVE_IDS[PUMP_COUNT] = {1, 2, 3};
 const char *const PUMP_NAMES[PUMP_COUNT] = {"CAHV 1", "CAHV 2", "QAHV"};
+const uint16_t SYSTEM_ON_REGISTER = 25;
 const uint16_t OPERATING_MODE_REGISTER = 26;
 const uint16_t OPERATING_MODE_HEATING = 2;
 const uint16_t OPERATING_MODE_HEATING_ECO = 7;
@@ -229,6 +230,60 @@ class HeatingEcoRelay : public Supla::Control::VirtualRelay {
 };
 
 HeatingEcoRelay *heatingEcoControl[CAHV_COUNT] = {};
+
+class SystemPowerRelay : public Supla::Control::VirtualRelay {
+ public:
+  int32_t handleNewValueFromServer(
+      TSD_SuplaChannelNewValue *newValue) override {
+    if (newValue == nullptr || newValue->value[0] > 1) return -1;
+
+    desiredOn = newValue->value[0] == 1;
+    commandPending = true;
+    return Supla::Control::VirtualRelay::handleNewValueFromServer(newValue);
+  }
+
+  bool hasPendingCommand() const {
+    return commandPending;
+  }
+
+  bool getDesiredOn() const {
+    return desiredOn;
+  }
+
+  void syncFromSystemState(uint16_t state) {
+    if (state > 1) return;
+
+    confirmedOn = state == 1;
+    if (!commandPending) setDisplayedState(confirmedOn);
+  }
+
+  void confirmCommand() {
+    confirmedOn = desiredOn;
+    commandPending = false;
+    setDisplayedState(confirmedOn);
+  }
+
+  void rejectCommand() {
+    commandPending = false;
+    setDisplayedState(confirmedOn);
+  }
+
+ private:
+  void setDisplayedState(bool on) {
+    if (on == isOn()) return;
+    if (on) {
+      turnOn();
+    } else {
+      turnOff();
+    }
+  }
+
+  bool commandPending = false;
+  bool desiredOn = true;
+  bool confirmedOn = true;
+};
+
+SystemPowerRelay *systemPowerControl[CAHV_COUNT] = {};
 
 class QahvThermoOffControl : public Supla::Control::HvacBase {
  public:
@@ -395,7 +450,7 @@ ModbusPollItem pollItems[] = {
   {OPERATING_MODE_REGISTER, 5000, {0}, REG_OPERATING_MODE, ALL_PUMPS},
   {9,   5000, {0}, REG_FAULT, ALL_PUMPS},
   {85,  5000, {0}, REG_FLOW_SETPOINT, ALL_PUMPS},
-  {25,  5000, {0}, REG_SYSTEM_ON, ALL_PUMPS},
+  {SYSTEM_ON_REGISTER, 5000, {0}, REG_SYSTEM_ON, ALL_PUMPS},
 
   {136, 60000, {0}, REG_RUNTIME_HOURS, CAHV_PUMPS},
   {137, 60000, {0}, REG_RUNTIME_HUNDREDS, CAHV_PUMPS},
@@ -993,6 +1048,9 @@ void applyRegisterValue(
 
     case REG_SYSTEM_ON:
       channels.systemOn->setValue(raw);
+      if (pump < CAHV_COUNT && systemPowerControl[pump] != nullptr) {
+        systemPowerControl[pump]->syncFromSystemState(raw);
+      }
       break;
 
     case REG_RUNTIME_HOURS:
@@ -1151,6 +1209,46 @@ void handleHeatingEcoControls() {
       control->confirmCommand();
     } else {
       Serial.print(": blad zapisu HR26, kod 0x");
+      Serial.println(lastModbusError[pump], HEX);
+      control->rejectCommand();
+    }
+
+    return;
+  }
+}
+
+
+void handleSystemPowerControls() {
+  for (uint8_t pump = 0; pump < CAHV_COUNT; pump++) {
+    SystemPowerRelay *control = systemPowerControl[pump];
+    if (control == nullptr || !control->hasPendingCommand()) continue;
+
+    PumpState &state = pumpState[pump];
+    if (!state.stateKnown || !state.online) {
+      Serial.print("MODBUS slave ");
+      Serial.print(PUMP_SLAVE_IDS[pump]);
+      Serial.println(": odrzucono System ON/OFF - brak komunikacji");
+      control->rejectCommand();
+      continue;
+    }
+
+    unsigned long now = millis();
+    if (now - lastModbusTransaction < MODBUS_MIN_GAP) return;
+
+    bool systemOn = control->getDesiredOn();
+    uint16_t value = systemOn ? 1 : 0;
+    bool ok = writeHR(pump, SYSTEM_ON_REGISTER, value);
+    lastModbusTransaction = millis();
+
+    Serial.print("MODBUS slave ");
+    Serial.print(PUMP_SLAVE_IDS[pump]);
+    if (ok) {
+      Serial.print(": ustawiono HR25 = ");
+      Serial.println(systemOn ? "1 (System ON)" : "0 (System OFF)");
+      applyRegisterValue(pump, REG_SYSTEM_ON, value);
+      control->confirmCommand();
+    } else {
+      Serial.print(": blad zapisu HR25, kod 0x");
       Serial.println(lastModbusError[pump], HEX);
       control->rejectCommand();
     }
@@ -2372,6 +2470,15 @@ void createSuplaChannels() {
   numberChannel(qahvThermoOffControl, 71);
   namePumpChannel(qahvThermoOffControl, 2, "Ustaw Thermo-off");
   qahvThermoOffControl->setMainThermometerChannelNo(45);
+
+  // 72-73: zapis HR25 dla CAHV. Start ESP nie wysyla zapisu.
+  for (uint8_t pump = 0; pump < CAHV_COUNT; pump++) {
+    systemPowerControl[pump] = new SystemPowerRelay();
+    numberChannel(systemPowerControl[pump], 72 + pump);
+    namePumpChannel(systemPowerControl[pump], pump, "System ON/OFF");
+    systemPowerControl[pump]->setDefaultFunction(SUPLA_CHANNELFNC_POWERSWITCH);
+    systemPowerControl[pump]->setDefaultStateOn();
+  }
 }
 
 
@@ -2591,6 +2698,7 @@ void loop() {
   // =================================================
 
   handleDsSensors();
+  handleSystemPowerControls();
   handleQahvThermoOffControl();
   handleHeatingEcoControls();
   handleModbusScheduler();
