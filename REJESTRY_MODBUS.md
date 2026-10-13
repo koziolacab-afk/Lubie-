@@ -1,6 +1,6 @@
 # Rejestry Modbus w firmware
 
-Stan mapowania: firmware 1.0.19 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
+Stan mapowania: firmware 1.0.20 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
 Adresy ponizej to adresy przekazywane wprost do `readHoldingRegisters(adres, 1)`
 (adresowanie od zera w ramce Modbus), a nie numeracja 4xxxx z niektorych
 programow. Jezeli program konfiguracyjny numeruje rejestry od 1, sprawdz jego
@@ -174,3 +174,18 @@ Kanal 64 pokazuje stan cewki; kanal 80 pokazuje odwrocony stan obwodu NC.
 To stan wynikajacy z polecenia, bez niezaleznego potwierdzenia przeplywu.
 Kanaly 61-64 odrzucaja reczne polecenia Cloud i nie udostepniaja timera,
 aby automatyka nie konkurowala ze sterowaniem recznym.
+
+## Odpornosc odczytow DS18B20
+
+Pomiar co 15 s, 12 bitow, 1 s na konwersje, jeden czujnik na obieg petli.
+DallasTemperature wykonuje do 3 prob odczytu scratchpada z kontrola CRC.
+Ostatnia poprawna temperatura jest zachowywana najwyzej przez 60 s.
+Po tym czasie kanal pokazuje brak danych; energia CWU jest niedostepna,
+jezeli brakuje aktualnego pomiaru ktoregokolwiek z pieciu zbiornikow.
+Nieudana proba nie odswieza czasu waznosci poprzedniego pomiaru.
+Bufor nie jest zapisywany do flash i po restarcie czeka na prawdziwy odczyt.
+Logi wskazuja poczatek bledu, wygasniecie pomiaru i przywrocenie odczytu.
+Adresy ROM przypisane do kanalow pozostaja bez zmian.
+Gdy wszystkie 8 czujnikow ma przypisane ROM, skanowanie co minute jest
+pomijane. Odczyty po ROM nadal ponawiaja sie po powrocie czujnika.
+Ustawianie rozdzielczosci nie zapisuje EEPROM czujnikow.

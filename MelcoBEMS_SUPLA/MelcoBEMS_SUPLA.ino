@@ -25,6 +25,7 @@
 #include <DallasTemperature.h>
 #include <string.h>
 #include "boiler_logic.h"
+#include "ds_sample.h"
 
 #include "esp_ota_ops.h"
 #include "esp_err.h"
@@ -34,7 +35,7 @@
 // WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.19"
+#define FW_VERSION "1.0.20"
 
 
 // =====================================================
@@ -108,7 +109,7 @@ const uint32_t BOOT_BUTTON_HOLD_MS = 5000;
 const double TANK_VOLUME_LITERS = 1000.0;
 const double CWU_COLD_REFERENCE_C = 10.0;
 const unsigned long DS_READ_INTERVAL = 15000;
-const unsigned long DS_CONVERSION_TIME = 800;
+const unsigned long DS_CONVERSION_TIME = 1000;
 
 OneWire oneWire(DS_DATA_PIN);
 DallasTemperature dsBus(&oneWire);
@@ -120,6 +121,11 @@ Supla::Control::Relay *physicalRelay[RELAY_COUNT] = {};
 bool dsConversionPending = false;
 unsigned long dsConversionStarted = 0;
 unsigned long lastDsDiscovery = 0;
+DsSample dsSample[DS_SENSOR_COUNT];
+bool dsReadError[DS_SENSOR_COUNT] = {};
+bool dsUnavailable[DS_SENSOR_COUNT] = {};
+uint8_t dsReadSlot = 0;
+unsigned long lastDsPublish = 0;
 
 const char *const DS_KEYS[DS_SENSOR_COUNT] = {
   "d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8"
@@ -2207,6 +2213,7 @@ void discoverDsSensors() {
   lastDsDiscovery = millis();
   dsBus.begin();
   dsBus.setWaitForConversion(false);
+  dsBus.setAutoSaveScratchPad(false);
   dsBus.setResolution(12);
 
   Preferences preferences;
@@ -2266,30 +2273,17 @@ void initDsSensors() {
   printDsBindings();
 }
 
-void handleDsSensors() {
-  unsigned long now = millis();
-  if (!dsConversionPending) {
-    if (now - lastDsDiscovery >= 60000) discoverDsSensors();
-    if (now - dsConversionStarted >= DS_READ_INTERVAL) {
-      dsBus.requestTemperatures();
-      dsConversionStarted = millis();
-      dsConversionPending = true;
-    }
-    return;
-  }
-  if (now - dsConversionStarted < DS_CONVERSION_TIME) return;
-
+void publishDsMeasurements(unsigned long now) {
   double totalKwh = 0;
   bool complete = true;
   for (uint8_t slot = 0; slot < DS_SENSOR_COUNT; slot++) {
-    double temperature = TEMPERATURE_NOT_AVAILABLE;
-    if (dsBound[slot]) {
-      temperature = dsBus.getTempC(dsAddress[slot]);
-      if (temperature == DEVICE_DISCONNECTED_C || temperature == 85.0 ||
-          temperature < -55.0 || temperature > 125.0) {
-        temperature = TEMPERATURE_NOT_AVAILABLE;
-      }
+    bool available = dsSample[slot].available(now);
+    double temperature = available ? dsSample[slot].temperature
+                                   : TEMPERATURE_NOT_AVAILABLE;
+    if (!available && !dsUnavailable[slot] && dsSample[slot].known) {
+      Serial.printf("DS18B20[%u]: brak poprawnego pomiaru przez 60 s\n", slot + 1);
     }
+    dsUnavailable[slot] = !available;
     dsChannel[slot]->setValue(temperature);
     if (slot < TANK_COUNT) {
       if (temperature == TEMPERATURE_NOT_AVAILABLE) {
@@ -2301,7 +2295,46 @@ void handleDsSensors() {
     }
   }
   cwuEnergy->setValue(complete ? totalKwh : NAN);
-  dsConversionPending = false;
+}
+
+void handleDsSensors() {
+  unsigned long now = millis();
+  if (now - lastDsPublish >= 1000) {
+    publishDsMeasurements(now);
+    lastDsPublish = now;
+  }
+  if (!dsConversionPending) {
+    bool unbound = false;
+    for (uint8_t slot = 0; slot < DS_SENSOR_COUNT; slot++) {
+      unbound = unbound || !dsBound[slot];
+    }
+    if (unbound && now - lastDsDiscovery >= 60000) discoverDsSensors();
+    if (now - dsConversionStarted >= DS_READ_INTERVAL) {
+      dsBus.requestTemperatures();
+      dsConversionStarted = millis();
+      dsReadSlot = 0;
+      dsConversionPending = true;
+    }
+    return;
+  }
+  if (now - dsConversionStarted < DS_CONVERSION_TIME) return;
+
+  // One sensor per loop allows SUPLA/Modbus/relay automation between reads.
+  uint8_t slot = dsReadSlot++;
+  if (dsBound[slot]) {
+    double value = dsBus.getTempC(dsAddress[slot], 2);
+    bool valid = dsSample[slot].accept(value, millis());
+    if (valid && dsReadError[slot]) {
+      Serial.printf("DS18B20[%u]: odczyt przywrocony\n", slot + 1);
+    } else if (!valid && !dsReadError[slot]) {
+      Serial.printf("DS18B20[%u]: blad odczytu po 3 probach\n", slot + 1);
+    }
+    dsReadError[slot] = !valid;
+  }
+  if (dsReadSlot >= DS_SENSOR_COUNT) {
+    dsConversionPending = false;
+    publishDsMeasurements(millis());
+  }
 }
 
 void createSuplaChannels() {

@@ -21,6 +21,8 @@ jobs:
         run: |
           g++ -std=c++11 -Wall -Wextra -Werror tests/boiler_logic_test.cpp -o /tmp/boiler_logic_test
           /tmp/boiler_logic_test
+          g++ -std=c++11 -Wall -Wextra -Werror tests/ds_sample_test.cpp -o /tmp/ds_sample_test
+          /tmp/ds_sample_test
 
       - name: Zainstaluj Arduino CLI
         uses: arduino/setup-arduino-cli@v2
