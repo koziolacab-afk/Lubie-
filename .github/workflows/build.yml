@@ -17,6 +17,11 @@ jobs:
       - name: Pobierz repo
         uses: actions/checkout@v4
 
+      - name: Test automatyki kotla i pompy NC
+        run: |
+          g++ -std=c++11 -Wall -Wextra -Werror tests/boiler_logic_test.cpp -o /tmp/boiler_logic_test
+          /tmp/boiler_logic_test
+
       - name: Zainstaluj Arduino CLI
         uses: arduino/setup-arduino-cli@v2
 

@@ -1,6 +1,6 @@
 # Rejestry Modbus w firmware
 
-Stan mapowania: firmware 1.0.18 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
+Stan mapowania: firmware 1.0.19 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
 Adresy ponizej to adresy przekazywane wprost do `readHoldingRegisters(adres, 1)`
 (adresowanie od zera w ramce Modbus), a nie numeracja 4xxxx z niektorych
 programow. Jezeli program konfiguracyjny numeruje rejestry od 1, sprawdz jego
@@ -31,6 +31,10 @@ czestotliwosc zalezy od obciazenia magistrali i odpowiedzi urzadzen.
 | 99 | wszystkie | 5 s | Temperatura zewnetrzna: `int16 / 10` °C | 0 / 15 / 29 |
 | 101 | wszystkie | 5 s | Temperatura wylotu wody: `int16 / 100` °C | 1 / 16 / 30 |
 | 103 | wszystkie | 5 s | Temperatura wlotu wody: `int16 / 100` °C | 2 / 17 / 31 |
+| 107 | QAHV | 5 s | External Water Temperature 1 / TH15: `int16 / 100` C | - / - / 76 |
+| 109 | QAHV | 5 s | External Water Temperature 3 / TH17 (czujnik Thermo-off): `int16 / 100` C | - / - / 77 |
+| 111 | QAHV | 15 s | External Water Temperature 4 / TH15(1): `int16 / 100` C | - / - / 78 |
+| 113 | QAHV | 15 s | External Water Temperature 6 / TH17(1): `int16 / 100` C | - / - / 79 |
 | 127 | wszystkie | 5 s | Praca pompy: `1` = ON, kazda inna wartosc = OFF | 4 / 19 / 33 |
 | 136 | tylko CAHV | 60 s | Skladnik godzin pracy dodawany bez zmian | 43* / 44* / - |
 | 137 | tylko CAHV | 60 s | Skladnik godzin pracy: setki godzin | 43* / 44* / - |
@@ -94,7 +98,15 @@ Uruchomienie ESP, cykliczny odczyt ani synchronizacja z SUPLA nie wysylaja
 zapisu. Po bledzie komunikacji suwak wraca do ostatniej odczytanej wartosci.
 Po udanym zapisie firmware zleca kontrolny odczyt HR30. Rzeczywista wartosc
 odczytana z QAHV pozostaje w osobnym kanale termometru 45 (`QAHV Temperatura
-Thermo-off`). Kanal udostepnia konfiguracje harmonogramu wymagana przez
+Thermo-off`) - jest to nastawa, a nie temperatura zmierzona.
+Glownym termometrem suwaka 71 jest teraz kanal 77: temperatura zmierzona
+przez TH17 (HR109), wybrany w instalacji jako czujnik wylaczenia QAHV.
+Powiazanie starej konfiguracji z kanalem 45 jest migrowane przy starcie.
+Kanaly 78/79 sa opcjonalne i maja sens tylko przy dostepnych TH15(1)/TH17(1).
+A1M nie udostepnia osobnego rejestru TH16 w tej tabeli.
+Niepoprawne odczyty oraz brak swiezej probki przez ponad 30 s sa oznaczane
+jako niedostepna temperatura, bez podstawiania nastawy za pomiar.
+Kanal udostepnia konfiguracje harmonogramu wymagana przez
 aplikacje mobilna SUPLA, ale wybranie trybu Program nie zapisuje HR30.
 
 ## Wartosci pochodne
@@ -119,6 +131,46 @@ ale **nie sa juz odpytywane**. Mozna je ukryc w SUPLA Cloud.
 
 Pozostale kanaly nie pochodza z Modbus: 9 uruchamia OTA, 52-59 to osiem
 czujnikow DS18B20, 60 to szacowana energia CWU, a 61-65 steruja piecioma
-lokalnymi przekaznikami. Przelaczenie fizycznych przekaznikow 64 i 65 nadal
-nie wysyla ramki Modbus; zapis HR26 realizuja wylacznie kanaly 69 i 70, a zapis
+lokalnymi przekaznikami. Kanal 64 jest teraz automatycznym CH4 dla pompy
+wtornego CO (styk NC), a 65 zachowuje sterowanie reczne CH5.
+Zapis HR26 realizuja wylacznie kanaly 69 i 70, a zapis
 HR25 realizuja wylacznie kanaly 72 i 73.
+
+## Automatyka kotla olejowego i pompa wtorna CO
+
+Nowe kanaly sa dopisane na koncu; numery i typy istniejacych kanalow pozostaja.
+
+| Kanal | Funkcja |
+| ---: | --- |
+| 74 | Nastawa progu temperatury zewnetrznej kotla dla CO |
+| 75 | Nastawa progu temperatury zewnetrznej kotla dla CWU |
+| 76-79 | Czujniki QAHV opisane w tabeli rejestrow |
+| 80 | Pompa wtorna CO: stan wynikajacy ze sterowania CH4 przez styk NC |
+
+Oba progi domyslnie wynosza -10 C, zakres regulacji -30..+20 C, krok 0,5 C.
+Termometry obu regulatorow sa powiazane z CAHV 1 (kanal 0, HR99).
+Ponizej progu wlacza sie zapotrzebowanie, a przy progu + 2 C wylacza sie.
+Przy domyslnej nastawie: ON ponizej -10 C, OFF od -8 C.
+Regulatory dzialaja w trybie recznej nastawy; OFF w danym regulatorze
+wylacza jego automatyczne zapotrzebowanie. Program/Timer nie steruja kotlem.
+Nastawy i wlaczenie regulatorow sa zapisywane w NVS po 2 s stabilnego stanu
+i odtwarzane po restarcie. Nie wymagaja polaczenia z Cloud.
+
+CO steruje CH2 (GPIO2, kanal 62), CWU steruje CH3 (GPIO41, kanal 63).
+CH1 (GPIO1, kanal 61) jest wlaczony, gdy CO LUB CWU wymaga pracy kotla.
+Przy wlaczaniu pompy sa ustawiane przed kotlem, przy calkowitym wylaczaniu
+kociol jest wylaczany przed pompami. Brak poprawnej, swiezej temperatury
+CAHV 1 (offline albo ponad 30 s bez odczytu) wylacza oba zapotrzebowania.
+Nie ma dodatkowego wybiegu pomp ani regulacji temperatury kotla;
+zabezpieczenia zapewnia jego wlasny sterownik.
+
+CH4 (GPIO42, kanal 64) wlacza cewke, aby WYLACZYC pompe podlaczona do NC.
+Pompa pracuje przy HR127 = 1 dowolnego CAHV LUB zapotrzebowaniu kotla na CO.
+Przy nieznanym/niepoprawnym/starym stanie dowolnego CAHV pompa pozostaje ON.
+Przy starcie GPIO42 jest LOW (cewka OFF, pompa ON).
+Pompa moze zostac wylaczona dopiero po swiezym potwierdzeniu zatrzymania
+obu CAHV i braku zapotrzebowania olejowego CO.
+Kanal 64 pokazuje stan cewki; kanal 80 pokazuje odwrocony stan obwodu NC.
+To stan wynikajacy z polecenia, bez niezaleznego potwierdzenia przeplywu.
+Kanaly 61-64 odrzucaja reczne polecenia Cloud i nie udostepniaja timera,
+aby automatyka nie konkurowala ze sterowaniem recznym.

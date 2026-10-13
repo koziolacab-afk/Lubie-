@@ -24,6 +24,7 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <string.h>
+#include "boiler_logic.h"
 
 #include "esp_ota_ops.h"
 #include "esp_err.h"
@@ -33,7 +34,7 @@
 // WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.18"
+#define FW_VERSION "1.0.19"
 
 
 // =====================================================
@@ -131,7 +132,7 @@ const char *const DS_CAPTIONS[DS_SENSOR_COUNT] = {
 };
 const char *const RELAY_CAPTIONS[RELAY_COUNT] = {
   "Kociol olejowy - zalaczanie", "Kociol olejowy - pompa CO",
-  "Kociol olejowy - pompa CWU", "CAHV 1 - tryb reczny",
+  "Kociol olejowy - pompa CWU", "CO wtorny - przekaznik NC",
   "CAHV 2 - tryb reczny"
 };
 
@@ -301,6 +302,12 @@ class QahvThermoOffControl : public Supla::Control::HvacBase {
     setButtonTemperatureStep(THERMO_OFF_STEP_RAW);
   }
 
+  void onInit() override {
+    Supla::Control::HvacBase::onInit();
+    // Migrate the old saved link to setpoint channel 45 to measured TH17.
+    setMainThermometerChannelNo(77);
+  }
+
   int32_t handleNewValueFromServer(
       TSD_SuplaChannelNewValue *newValue) override {
     if (newValue == nullptr) return -1;
@@ -369,6 +376,111 @@ class QahvThermoOffControl : public Supla::Control::HvacBase {
 
 QahvThermoOffControl *qahvThermoOffControl = nullptr;
 
+// CH1-CH4 are owned by local automation; cloud commands must not pulse them.
+class AutomaticRelay : public Supla::Control::Relay {
+ public:
+  explicit AutomaticRelay(uint8_t pin)
+      : Supla::Control::Relay(pin, true, SUPLA_BIT_FUNC_POWERSWITCH) {}
+  int32_t handleNewValueFromServer(TSD_SuplaChannelNewValue *) override {
+    return -1;
+  }
+};
+
+class OilBoilerControl : public Supla::Control::HvacBase {
+ public:
+  explicit OilBoilerControl(const char *key)
+      : Supla::Control::HvacBase(nullptr), storageKey(key) {
+    setHeatingAndCoolingSupported(true);
+    getChannel()->setDefaultFunction(SUPLA_CHANNELFNC_HVAC_THERMOSTAT);
+    setDefaultSubfunction(SUPLA_HVAC_SUBFUNCTION_HEAT);
+    setTemperatureRoomMin(-3000);
+    setTemperatureRoomMax(2000);
+    setDefaultTemperatureRoomMin(SUPLA_CHANNELFNC_HVAC_THERMOSTAT, -3000);
+    setDefaultTemperatureRoomMax(SUPLA_CHANNELFNC_HVAC_THERMOSTAT, 2000);
+    setButtonTemperatureStep(50);
+    setAntiFreezeAndHeatProtectionEnabled(false);
+    getChannel()->unsetFlag(SUPLA_CHANNEL_FLAG_COUNTDOWN_TIMER_SUPPORTED);
+  }
+
+  void onInit() override {
+    Supla::Control::HvacBase::onInit();
+    Preferences preferences;
+    int16_t threshold = -1000;
+    bool enabled = true;
+    if (preferences.begin("oil_control", true)) {
+      threshold = preferences.getShort(storageKey, -1000);
+      char modeKey[8];
+      snprintf(modeKey, sizeof(modeKey), "%s_on", storageKey);
+      enabled = preferences.getBool(modeKey, true);
+      preferences.end();
+    }
+    if (threshold < -3000 || threshold > 2000) threshold = -1000;
+    setTemperatureSetpointHeat(threshold);
+    setTargetMode(enabled ? SUPLA_HVAC_MODE_HEAT : SUPLA_HVAC_MODE_OFF);
+    setMainThermometerChannelNo(0);
+    savedThreshold = pendingThreshold = threshold;
+    savedEnabled = pendingEnabled = enabled;
+  }
+
+  int32_t handleNewValueFromServer(TSD_SuplaChannelNewValue *value) override {
+    if (value == nullptr) return -1;
+    TSD_SuplaChannelNewValue normalized = *value;
+    THVACValue *hvac = reinterpret_cast<THVACValue *>(normalized.value);
+    normalized.DurationSec = 0;
+    hvac->Mode = hvac->Mode == SUPLA_HVAC_MODE_OFF
+                   ? SUPLA_HVAC_MODE_OFF : SUPLA_HVAC_MODE_HEAT;
+    return Supla::Control::HvacBase::handleNewValueFromServer(&normalized);
+  }
+
+  void updateDemand(bool fresh, double outdoor, unsigned long now) {
+    int threshold = getTemperatureSetpointHeat();
+    bool enabled = getMode() == SUPLA_HVAC_MODE_HEAT;
+    demand = BoilerLogic::demand(demand, enabled, fresh, outdoor, threshold);
+    getChannel()->setHvacFlagHeating(demand);
+    getChannel()->setHvacIsOn(demand);
+    getChannel()->setHvacFlagThermometerError(!fresh);
+    // Persist only settled changes; do not write flash on each loop/sample.
+    if (threshold != pendingThreshold || enabled != pendingEnabled) {
+      pendingThreshold = threshold;
+      pendingEnabled = enabled;
+      changedAt = now;
+    }
+    if ((threshold != savedThreshold || enabled != savedEnabled) &&
+        now - changedAt >= 2000) {
+      Preferences preferences;
+      if (preferences.begin("oil_control", false)) {
+        char modeKey[8];
+        snprintf(modeKey, sizeof(modeKey), "%s_on", storageKey);
+        bool saved = preferences.putShort(storageKey, threshold) == sizeof(int16_t);
+        saved = preferences.putBool(modeKey, enabled) == sizeof(bool) && saved;
+        preferences.end();
+        if (saved) {
+          savedThreshold = threshold;
+          savedEnabled = enabled;
+        }
+      }
+      changedAt = now;
+    }
+  }
+
+  bool hasDemand() const { return demand; }
+
+ private:
+  const char *storageKey;
+  bool demand = false;
+  int pendingThreshold = INT16_MIN;
+  int savedThreshold = INT16_MIN;
+  bool pendingEnabled = false;
+  bool savedEnabled = false;
+  unsigned long changedAt = 0;
+};
+
+OilBoilerControl *oilControl[2] = {};
+Supla::Sensor::VirtualThermometer *qahvExternalTemp[4] = {};
+unsigned long qahvExternalSampleAt[4] = {};
+bool qahvExternalKnown[4] = {};
+Supla::Sensor::VirtualBinary *secondaryPumpStatus = nullptr;
+
 // 10
 Supla::Sensor::GeneralPurposeMeasurement *defrostStatus;
 
@@ -420,7 +532,11 @@ enum RegisterType {
   REG_SYSTEM_ON,
   REG_RUNTIME_HOURS,
   REG_RUNTIME_HUNDREDS,
-  REG_THERMO_OFF
+  REG_THERMO_OFF,
+  REG_QAHV_TH15,
+  REG_QAHV_TH17,
+  REG_QAHV_TH15_SECOND,
+  REG_QAHV_TH17_SECOND
 };
 
 void applyRegisterValue(uint8_t pump, uint8_t type, uint16_t raw);
@@ -454,7 +570,11 @@ ModbusPollItem pollItems[] = {
 
   {136, 60000, {0}, REG_RUNTIME_HOURS, CAHV_PUMPS},
   {137, 60000, {0}, REG_RUNTIME_HUNDREDS, CAHV_PUMPS},
-  {THERMO_OFF_REGISTER, 60000, {0}, REG_THERMO_OFF, QAHV_PUMP}
+  {THERMO_OFF_REGISTER, 60000, {0}, REG_THERMO_OFF, QAHV_PUMP},
+  {107, 5000, {0}, REG_QAHV_TH15, QAHV_PUMP},
+  {109, 5000, {0}, REG_QAHV_TH17, QAHV_PUMP},
+  {111, 15000, {0}, REG_QAHV_TH15_SECOND, QAHV_PUMP},
+  {113, 15000, {0}, REG_QAHV_TH17_SECOND, QAHV_PUMP}
 };
 
 
@@ -504,6 +624,12 @@ struct PumpState {
   uint32_t lastFrequencySample;
   uint32_t lastRuntimeSaveFailure;
   bool runtimeSaveFailed;
+  double outdoorValue;
+  unsigned long lastOutdoorSample;
+  bool outdoorKnown;
+  unsigned long lastRunningSample;
+  bool runningKnown;
+  bool unitRunning;
   int32_t lastDefrostDescription;
   int32_t lastOperatingDescription;
   int32_t lastFaultDescription;
@@ -733,6 +859,8 @@ void setModbusOnline(uint8_t pump, bool online) {
   state.online = online;
 
   if (!online) {
+    state.outdoorKnown = false;
+    state.runningKnown = false;
     state.haveFlow = false;
     state.haveReturn = false;
     state.frequencyKnown = false;
@@ -893,6 +1021,9 @@ void applyRegisterValue(
         ((int16_t)raw) / 10.0;
 
       channels.outdoor->setValue(value);
+      state.outdoorValue = value;
+      state.outdoorKnown = value >= -40.0 && value <= 87.5;
+      state.lastOutdoorSample = millis();
 
       break;
     }
@@ -972,6 +1103,10 @@ void applyRegisterValue(
     // -----------------------------------------------
 
     case REG_HP_RUNNING: {
+
+      state.unitRunning = raw == 1;
+      state.runningKnown = raw <= 1;
+      state.lastRunningSample = millis();
 
       if (raw == 1) {
 
@@ -1069,6 +1204,19 @@ void applyRegisterValue(
         qahvThermoOffControl->syncFromRegister((int16_t)raw);
       }
       break;
+
+    case REG_QAHV_TH15:
+    case REG_QAHV_TH17:
+    case REG_QAHV_TH15_SECOND:
+    case REG_QAHV_TH17_SECOND: {
+      uint8_t slot = type - REG_QAHV_TH15;
+      double value = ((int16_t)raw) / 100.0;
+      qahvExternalSampleAt[slot] = millis();
+      qahvExternalKnown[slot] = value >= -40.0 && value <= 120.0;
+      qahvExternalTemp[slot]->setValue(
+          value >= -40.0 && value <= 120.0 ? value : -275.0);
+      break;
+    }
   }
 
   if ((type == REG_FLOW || type == REG_RETURN) &&
@@ -2435,10 +2583,15 @@ void createSuplaChannels() {
   cwuEnergy->setDefaultValuePrecision(1);
   cwuEnergy->setValue(NAN);
 
-  // 61-65: tylko sterowanie reczne. Automatyka kotla zostanie dodana pozniej.
+  // 61-64: local automation; 65 retains manual control.
   for (uint8_t relay = 0; relay < RELAY_COUNT; relay++) {
-    physicalRelay[relay] = new Supla::Control::Relay(
-      RELAY_PINS[relay], true, SUPLA_BIT_FUNC_POWERSWITCH);
+    if (relay < 4) {
+      physicalRelay[relay] = new AutomaticRelay(RELAY_PINS[relay]);
+      physicalRelay[relay]->disableCountdownTimerFunction();
+    } else {
+      physicalRelay[relay] = new Supla::Control::Relay(
+        RELAY_PINS[relay], true, SUPLA_BIT_FUNC_POWERSWITCH);
+    }
     numberChannel(physicalRelay[relay], 61 + relay);
     physicalRelay[relay]->setInitialCaption(RELAY_CAPTIONS[relay]);
     physicalRelay[relay]->setDefaultFunction(SUPLA_CHANNELFNC_POWERSWITCH);
@@ -2469,7 +2622,7 @@ void createSuplaChannels() {
   qahvThermoOffControl = new QahvThermoOffControl();
   numberChannel(qahvThermoOffControl, 71);
   namePumpChannel(qahvThermoOffControl, 2, "Ustaw Thermo-off");
-  qahvThermoOffControl->setMainThermometerChannelNo(45);
+  qahvThermoOffControl->setMainThermometerChannelNo(77);
 
   // 72-73: zapis HR25 dla CAHV. Start ESP nie wysyla zapisu.
   for (uint8_t pump = 0; pump < CAHV_COUNT; pump++) {
@@ -2479,6 +2632,73 @@ void createSuplaChannels() {
     systemPowerControl[pump]->setDefaultFunction(SUPLA_CHANNELFNC_POWERSWITCH);
     systemPowerControl[pump]->setDefaultStateOn();
   }
+
+  // Append-only numbering preserves existing Cloud captions/icons.
+  const char *oilCaptions[2] = {
+    "Kociol olejowy CO - prog zewnetrzny",
+    "Kociol olejowy CWU - prog zewnetrzny"
+  };
+  for (uint8_t circuit = 0; circuit < 2; circuit++) {
+    oilControl[circuit] = new OilBoilerControl(circuit == 0 ? "co" : "cwu");
+    numberChannel(oilControl[circuit], 74 + circuit);
+    oilControl[circuit]->setInitialCaption(oilCaptions[circuit]);
+    oilControl[circuit]->setMainThermometerChannelNo(0);
+  }
+  const char *sensorCaptions[4] = {
+    "Czujnik TH15", "Czujnik TH17 - Thermo-off",
+    "Czujnik TH15(1)", "Czujnik TH17(1)"
+  };
+  for (uint8_t slot = 0; slot < 4; slot++) {
+    qahvExternalTemp[slot] = new Supla::Sensor::VirtualThermometer();
+    numberChannel(qahvExternalTemp[slot], 76 + slot);
+    namePumpChannel(qahvExternalTemp[slot], 2, sensorCaptions[slot]);
+    qahvExternalTemp[slot]->setValue(-275.0);
+  }
+  secondaryPumpStatus = new Supla::Sensor::VirtualBinary();
+  numberChannel(secondaryPumpStatus, 80);
+  secondaryPumpStatus->setInitialCaption("CO wtorny - praca pompy (NC)");
+  secondaryPumpStatus->set();
+}
+
+void setAutomaticRelay(uint8_t relay, bool on) {
+  if (physicalRelay[relay]->isOn() == on) return;
+  if (on) physicalRelay[relay]->turnOn();
+  else physicalRelay[relay]->turnOff();
+}
+
+void handleBoilerAutomation() {
+  unsigned long now = millis();
+  const PumpState &source = pumpState[0];
+  bool fresh = BoilerLogic::fresh(source.online, source.outdoorKnown,
+                                 now, source.lastOutdoorSample);
+  for (uint8_t circuit = 0; circuit < 2; circuit++) {
+    oilControl[circuit]->updateDemand(fresh, source.outdoorValue, now);
+  }
+  bool co = oilControl[0]->hasDemand();
+  bool cwu = oilControl[1]->hasDemand();
+  bool known[CAHV_COUNT] = {};
+  for (uint8_t pump = 0; pump < CAHV_COUNT; pump++) {
+    const PumpState &state = pumpState[pump];
+    // Unknown/stale CAHV status keeps the NC-connected circulation pump on.
+    known[pump] = BoilerLogic::fresh(state.online, state.runningKnown,
+                                    now, state.lastRunningSample);
+  }
+  bool secondaryOn = BoilerLogic::secondaryPump(
+      co, known[0], pumpState[0].unitRunning,
+      known[1], pumpState[1].unitRunning);
+  for (uint8_t slot = 0; slot < 4; slot++) {
+    if (!BoilerLogic::fresh(pumpState[2].online, qahvExternalKnown[slot],
+                           now, qahvExternalSampleAt[slot])) {
+      qahvExternalTemp[slot]->setValue(-275.0);
+    }
+  }
+  if (!co && !cwu) setAutomaticRelay(0, false);
+  setAutomaticRelay(1, co);
+  setAutomaticRelay(2, cwu);
+  setAutomaticRelay(3, !secondaryOn);
+  if (co || cwu) setAutomaticRelay(0, true);
+  if (secondaryOn) secondaryPumpStatus->set();
+  else secondaryPumpStatus->clear();
 }
 
 
@@ -2702,6 +2922,7 @@ void loop() {
   handleQahvThermoOffControl();
   handleHeatingEcoControls();
   handleModbusScheduler();
+  handleBoilerAutomation();
   for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
     updateCompressorRuntime(pump);
   }
