@@ -35,7 +35,7 @@
 // WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.20"
+#define FW_VERSION "1.0.21"
 
 
 // =====================================================
@@ -90,6 +90,8 @@ const uint16_t OPERATING_MODE_REGISTER = 26;
 const uint16_t OPERATING_MODE_HEATING = 2;
 const uint16_t OPERATING_MODE_HEATING_ECO = 7;
 const uint16_t THERMO_OFF_REGISTER = 30;
+const uint8_t QAHV_TH17_CHANNEL = 77;
+const uint8_t QAHV_EXTERNAL_SENSOR_COUNT = 2;
 const int16_t THERMO_OFF_MIN_RAW = 4000;
 const int16_t THERMO_OFF_MAX_RAW = 9000;
 const int16_t THERMO_OFF_STEP_RAW = 50;
@@ -306,12 +308,20 @@ class QahvThermoOffControl : public Supla::Control::HvacBase {
     setTemperatureRoomMin(THERMO_OFF_MIN_RAW);
     setTemperatureRoomMax(THERMO_OFF_MAX_RAW);
     setButtonTemperatureStep(THERMO_OFF_STEP_RAW);
+    parameterFlags.MainThermometerChannelNoReadonly = 1;
   }
 
   void onInit() override {
     Supla::Control::HvacBase::onInit();
     // Migrate the old saved link to setpoint channel 45 to measured TH17.
-    setMainThermometerChannelNo(77);
+    setMainThermometerChannelNo(QAHV_TH17_CHANNEL);
+  }
+
+  void iterateAlways() override {
+    if (getMainThermometerChannelNo() != QAHV_TH17_CHANNEL) {
+      setMainThermometerChannelNo(QAHV_TH17_CHANNEL);
+    }
+    Supla::Control::HvacBase::iterateAlways();
   }
 
   int32_t handleNewValueFromServer(
@@ -370,6 +380,16 @@ class QahvThermoOffControl : public Supla::Control::HvacBase {
   void rejectCommand() {
     commandPending = false;
     if (confirmedKnown) setTemperatureSetpointHeat(confirmedRaw);
+  }
+
+ protected:
+  bool applyAdditionalValidation(TChannelConfig_HVAC *configuration) override {
+    if (configuration == nullptr ||
+        configuration->MainThermometerChannelNo == QAHV_TH17_CHANNEL) {
+      return false;
+    }
+    configuration->MainThermometerChannelNo = QAHV_TH17_CHANNEL;
+    return true;
   }
 
  private:
@@ -482,9 +502,9 @@ class OilBoilerControl : public Supla::Control::HvacBase {
 };
 
 OilBoilerControl *oilControl[2] = {};
-Supla::Sensor::VirtualThermometer *qahvExternalTemp[4] = {};
-unsigned long qahvExternalSampleAt[4] = {};
-bool qahvExternalKnown[4] = {};
+Supla::Sensor::VirtualThermometer *qahvExternalTemp[QAHV_EXTERNAL_SENSOR_COUNT] = {};
+unsigned long qahvExternalSampleAt[QAHV_EXTERNAL_SENSOR_COUNT] = {};
+bool qahvExternalKnown[QAHV_EXTERNAL_SENSOR_COUNT] = {};
 Supla::Sensor::VirtualBinary *secondaryPumpStatus = nullptr;
 
 // 10
@@ -540,9 +560,7 @@ enum RegisterType {
   REG_RUNTIME_HUNDREDS,
   REG_THERMO_OFF,
   REG_QAHV_TH15,
-  REG_QAHV_TH17,
-  REG_QAHV_TH15_SECOND,
-  REG_QAHV_TH17_SECOND
+  REG_QAHV_TH17
 };
 
 void applyRegisterValue(uint8_t pump, uint8_t type, uint16_t raw);
@@ -578,9 +596,7 @@ ModbusPollItem pollItems[] = {
   {137, 60000, {0}, REG_RUNTIME_HUNDREDS, CAHV_PUMPS},
   {THERMO_OFF_REGISTER, 60000, {0}, REG_THERMO_OFF, QAHV_PUMP},
   {107, 5000, {0}, REG_QAHV_TH15, QAHV_PUMP},
-  {109, 5000, {0}, REG_QAHV_TH17, QAHV_PUMP},
-  {111, 15000, {0}, REG_QAHV_TH15_SECOND, QAHV_PUMP},
-  {113, 15000, {0}, REG_QAHV_TH17_SECOND, QAHV_PUMP}
+  {109, 5000, {0}, REG_QAHV_TH17, QAHV_PUMP}
 };
 
 
@@ -1212,9 +1228,7 @@ void applyRegisterValue(
       break;
 
     case REG_QAHV_TH15:
-    case REG_QAHV_TH17:
-    case REG_QAHV_TH15_SECOND:
-    case REG_QAHV_TH17_SECOND: {
+    case REG_QAHV_TH17: {
       uint8_t slot = type - REG_QAHV_TH15;
       double value = ((int16_t)raw) / 100.0;
       qahvExternalSampleAt[slot] = millis();
@@ -2655,7 +2669,7 @@ void createSuplaChannels() {
   qahvThermoOffControl = new QahvThermoOffControl();
   numberChannel(qahvThermoOffControl, 71);
   namePumpChannel(qahvThermoOffControl, 2, "Ustaw Thermo-off");
-  qahvThermoOffControl->setMainThermometerChannelNo(77);
+  qahvThermoOffControl->setMainThermometerChannelNo(QAHV_TH17_CHANNEL);
 
   // 72-73: zapis HR25 dla CAHV. Start ESP nie wysyla zapisu.
   for (uint8_t pump = 0; pump < CAHV_COUNT; pump++) {
@@ -2677,15 +2691,22 @@ void createSuplaChannels() {
     oilControl[circuit]->setInitialCaption(oilCaptions[circuit]);
     oilControl[circuit]->setMainThermometerChannelNo(0);
   }
-  const char *sensorCaptions[4] = {
-    "Czujnik TH15", "Czujnik TH17 - Thermo-off",
-    "Czujnik TH15(1)", "Czujnik TH17(1)"
+  const char *sensorCaptions[QAHV_EXTERNAL_SENSOR_COUNT] = {
+    "Czujnik TH15", "Czujnik TH17 - Thermo-off"
   };
-  for (uint8_t slot = 0; slot < 4; slot++) {
+  for (uint8_t slot = 0; slot < QAHV_EXTERNAL_SENSOR_COUNT; slot++) {
     qahvExternalTemp[slot] = new Supla::Sensor::VirtualThermometer();
     numberChannel(qahvExternalTemp[slot], 76 + slot);
     namePumpChannel(qahvExternalTemp[slot], 2, sensorCaptions[slot]);
     qahvExternalTemp[slot]->setValue(-275.0);
+  }
+  // Retain channel types/numbers already registered in Cloud; no Modbus polls.
+  for (uint8_t slot = 0; slot < 2; slot++) {
+    auto reserved = new Supla::Sensor::VirtualThermometer();
+    numberChannel(reserved, 78 + slot);
+    namePumpChannel(reserved, 2, slot == 0
+        ? "Rezerwa TH15(1) - nieuzywany" : "Rezerwa TH17(1) - nieuzywany");
+    reserved->setValue(-275.0);
   }
   secondaryPumpStatus = new Supla::Sensor::VirtualBinary();
   numberChannel(secondaryPumpStatus, 80);
@@ -2719,7 +2740,7 @@ void handleBoilerAutomation() {
   bool secondaryOn = BoilerLogic::secondaryPump(
       co, known[0], pumpState[0].unitRunning,
       known[1], pumpState[1].unitRunning);
-  for (uint8_t slot = 0; slot < 4; slot++) {
+  for (uint8_t slot = 0; slot < QAHV_EXTERNAL_SENSOR_COUNT; slot++) {
     if (!BoilerLogic::fresh(pumpState[2].online, qahvExternalKnown[slot],
                            now, qahvExternalSampleAt[slot])) {
       qahvExternalTemp[slot]->setValue(-275.0);

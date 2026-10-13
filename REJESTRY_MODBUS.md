@@ -1,6 +1,6 @@
 # Rejestry Modbus w firmware
 
-Stan mapowania: firmware 1.0.20 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
+Stan mapowania: firmware 1.0.21 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
 Adresy ponizej to adresy przekazywane wprost do `readHoldingRegisters(adres, 1)`
 (adresowanie od zera w ramce Modbus), a nie numeracja 4xxxx z niektorych
 programow. Jezeli program konfiguracyjny numeruje rejestry od 1, sprawdz jego
@@ -33,8 +33,6 @@ czestotliwosc zalezy od obciazenia magistrali i odpowiedzi urzadzen.
 | 103 | wszystkie | 5 s | Temperatura wlotu wody: `int16 / 100` °C | 2 / 17 / 31 |
 | 107 | QAHV | 5 s | External Water Temperature 1 / TH15: `int16 / 100` C | - / - / 76 |
 | 109 | QAHV | 5 s | External Water Temperature 3 / TH17 (czujnik Thermo-off): `int16 / 100` C | - / - / 77 |
-| 111 | QAHV | 15 s | External Water Temperature 4 / TH15(1): `int16 / 100` C | - / - / 78 |
-| 113 | QAHV | 15 s | External Water Temperature 6 / TH17(1): `int16 / 100` C | - / - / 79 |
 | 127 | wszystkie | 5 s | Praca pompy: `1` = ON, kazda inna wartosc = OFF | 4 / 19 / 33 |
 | 136 | tylko CAHV | 60 s | Skladnik godzin pracy dodawany bez zmian | 43* / 44* / - |
 | 137 | tylko CAHV | 60 s | Skladnik godzin pracy: setki godzin | 43* / 44* / - |
@@ -102,7 +100,12 @@ Thermo-off`) - jest to nastawa, a nie temperatura zmierzona.
 Glownym termometrem suwaka 71 jest teraz kanal 77: temperatura zmierzona
 przez TH17 (HR109), wybrany w instalacji jako czujnik wylaczenia QAHV.
 Powiazanie starej konfiguracji z kanalem 45 jest migrowane przy starcie.
-Kanaly 78/79 sa opcjonalne i maja sens tylko przy dostepnych TH15(1)/TH17(1).
+Od 1.0.21 glowne przypisanie do kanalu 77 jest readonly; konfiguracja
+otrzymana z Cloud jest korygowana, a powiazanie pilnowane takze w petli HVAC.
+Nie trzeba resetowac urzadzenia do ustawien fabrycznych ani zmieniac GUID.
+Kanaly 78/79 (TH15(1)/TH17(1)) sa od 1.0.21 zarezerwowane bez pomiarow
+i bez odpytywania HR111/113. W tej instalacji ich nie ma; mozna ukryc je
+w SUPLA Cloud. Numery/typy sa zachowane dla zgodnosci, jak kanaly 6-8.
 A1M nie udostepnia osobnego rejestru TH16 w tej tabeli.
 Niepoprawne odczyty oraz brak swiezej probki przez ponad 30 s sa oznaczane
 jako niedostepna temperatura, bez podstawiania nastawy za pomiar.
@@ -144,7 +147,8 @@ Nowe kanaly sa dopisane na koncu; numery i typy istniejacych kanalow pozostaja.
 | ---: | --- |
 | 74 | Nastawa progu temperatury zewnetrznej kotla dla CO |
 | 75 | Nastawa progu temperatury zewnetrznej kotla dla CWU |
-| 76-79 | Czujniki QAHV opisane w tabeli rejestrow |
+| 76-77 | Czujniki QAHV TH15 i TH17 opisane w tabeli rejestrow |
+| 78-79 | Rezerwa po dodatkowych czujnikach (1); ukryc w Cloud |
 | 80 | Pompa wtorna CO: stan wynikajacy ze sterowania CH4 przez styk NC |
 
 Oba progi domyslnie wynosza -10 C, zakres regulacji -30..+20 C, krok 0,5 C.
