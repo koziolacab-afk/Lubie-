@@ -35,7 +35,7 @@
 // WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.21"
+#define FW_VERSION "1.0.22"
 
 
 // =====================================================
@@ -86,6 +86,7 @@ const uint8_t CAHV_COUNT = 2;
 const uint8_t PUMP_SLAVE_IDS[PUMP_COUNT] = {1, 2, 3};
 const char *const PUMP_NAMES[PUMP_COUNT] = {"CAHV 1", "CAHV 2", "QAHV"};
 const uint16_t SYSTEM_ON_REGISTER = 25;
+const uint16_t FAULT_DECIMAL_REGISTER = 12;
 const uint16_t OPERATING_MODE_REGISTER = 26;
 const uint16_t OPERATING_MODE_HEATING = 2;
 const uint16_t OPERATING_MODE_HEATING_ECO = 7;
@@ -588,7 +589,7 @@ ModbusPollItem pollItems[] = {
   {127, 5000, {0}, REG_HP_RUNNING, ALL_PUMPS},
   {67,  5000, {0}, REG_DEFROST, ALL_PUMPS},
   {OPERATING_MODE_REGISTER, 5000, {0}, REG_OPERATING_MODE, ALL_PUMPS},
-  {9,   5000, {0}, REG_FAULT, ALL_PUMPS},
+  {FAULT_DECIMAL_REGISTER, 5000, {0}, REG_FAULT, ALL_PUMPS},
   {85,  5000, {0}, REG_FLOW_SETPOINT, ALL_PUMPS},
   {SYSTEM_ON_REGISTER, 5000, {0}, REG_SYSTEM_ON, ALL_PUMPS},
 
@@ -622,12 +623,6 @@ struct PumpState {
   uint8_t failures;
   bool online;
   bool stateKnown;
-  uint16_t defrost;
-  uint16_t operatingMode;
-  uint16_t fault;
-  bool haveDefrost;
-  bool haveOperatingMode;
-  bool haveFault;
   uint16_t runtimeRemainder;
   uint16_t runtimeHundreds;
   bool haveRuntimeRemainder;
@@ -652,9 +647,6 @@ struct PumpState {
   unsigned long lastRunningSample;
   bool runningKnown;
   bool unitRunning;
-  int32_t lastDefrostDescription;
-  int32_t lastOperatingDescription;
-  int32_t lastFaultDescription;
 };
 
 PumpState pumpState[PUMP_COUNT] = {};
@@ -756,10 +748,6 @@ void updateCompressorRuntime(uint8_t pump) {
   }
 }
 
-
-// =====================================================
-// STATUSY DO HACKU GPM
-// =====================================================
 
 // =====================================================
 // SUPLA CONFIG
@@ -919,103 +907,6 @@ void setModbusOnline(uint8_t pump, bool online) {
 
 
 // =====================================================
-// TEKSTY STATUSOW
-//
-// Unit GPM ma ograniczona dlugosc,
-// dlatego teksty sa krotkie.
-// =====================================================
-
-const char *getDefrostText(
-  uint16_t value
-) {
-
-  switch (value) {
-
-    case 0:
-      return "Normal";
-
-    case 1:
-      return "Standby";
-
-    case 2:
-      return "Defrost";
-
-    case 3:
-      return "Wait restart";
-
-    default:
-      return "Unknown";
-  }
-}
-
-
-const char *getOperatingModeText(
-  uint16_t value
-) {
-
-  switch (value) {
-
-    case 0:
-      return "Stop";
-
-    case 1:
-      return "Hot water";
-
-    case 2:
-      return "Heating";
-
-    case 3:
-      return "Cooling";
-
-    case 4:
-      return "DHW contact";
-
-    case 5:
-      return "Freeze stat";
-
-    case 6:
-      return "Legionella";
-
-    case 7:
-      return "Heating Eco";
-
-    case 8:
-      return "Mode 1";
-
-    case 9:
-      return "Mode 2";
-
-    case 10:
-      return "Mode 3";
-
-    case 11:
-      return "Heat contact";
-
-    default:
-      return "Unknown";
-  }
-}
-
-
-const char *getFaultText(
-  uint16_t value
-) {
-
-  if (value == 0x8000) {
-
-    return "OK";
-  }
-
-  if (value == 0x6999) {
-
-    return "Comm error";
-  }
-
-  return "Fault";
-}
-
-
-// =====================================================
 // PRZETWARZANIE REJESTROW
 // =====================================================
 
@@ -1153,10 +1044,6 @@ void applyRegisterValue(
 
       channels.defrost->setValue(raw);
 
-      state.defrost = raw;
-      state.haveDefrost = true;
-
-
       break;
     }
 
@@ -1170,9 +1057,6 @@ void applyRegisterValue(
 
       channels.mode->setValue(raw);
 
-      state.operatingMode = raw;
-      state.haveOperatingMode = true;
-
       if (pump < CAHV_COUNT && heatingEcoControl[pump] != nullptr) {
         heatingEcoControl[pump]->syncFromOperatingMode(raw);
       }
@@ -1184,15 +1068,12 @@ void applyRegisterValue(
 
     // -----------------------------------------------
     // Fault code
-    // addr 9
+    // addr 12 (decimal); 8000 means no error
     // -----------------------------------------------
 
     case REG_FAULT: {
 
-      channels.fault->setValue(raw);
-
-      state.fault = raw;
-      state.haveFault = true;
+      channels.fault->setValue(raw == 8000 ? 0 : raw);
 
 
       break;
@@ -1510,19 +1391,10 @@ void configureGpmHistory(bool notifyCloud) {
 
 
 // =====================================================
-// STATUS TEXT HACK
-//
-// Wynik w SUPLA:
-//
-// 2 Defrost
-// 2 Heating
-// 32768 OK
-// 1 ATW
-//
-// Aktualizujemy unit TYLKO po zmianie statusu.
+// GPM CONFIGURATION: HISTORY AND LEGACY UNIT CLEANUP
 // =====================================================
 
-void updateStatusDescriptions() {
+void handleGpmConfiguration() {
 
   bool ready =
     SuplaDevice.getCurrentStatus() ==
@@ -1548,16 +1420,6 @@ void updateStatusDescriptions() {
       millis();
 
 
-    // Pozwalamy ponownie wyslac opis
-    // po reconnect.
-    for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
-      PumpState &state = pumpState[pump];
-      state.lastDefrostDescription = -1;
-      state.lastOperatingDescription = -1;
-      state.lastFaultDescription = -1;
-    }
-
-
     return;
   }
 
@@ -1577,31 +1439,19 @@ void updateStatusDescriptions() {
   // Historia ustawiana po synchronizacji
   // konfiguracji z Cloud.
   if (!historyConfigured || millis() - lastHistoryCheck >= 60000) {
+    // Clear old captions stored as units in LittleFS/Cloud. These setters
+    // are no-ops once empty and are no longer driven by status changes.
+    for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
+      pumpChannels[pump].defrost->setUnitAfterValue("");
+      pumpChannels[pump].mode->setUnitAfterValue("");
+      pumpChannels[pump].fault->setUnitAfterValue("");
+    }
     configureGpmHistory(true);
     historyConfigured = true;
     lastHistoryCheck = millis();
   }
 
 
-  for (uint8_t pump = 0; pump < PUMP_COUNT; pump++) {
-    PumpState &state = pumpState[pump];
-    PumpChannels &channels = pumpChannels[pump];
-    if (state.haveDefrost &&
-        state.defrost != state.lastDefrostDescription) {
-      channels.defrost->setUnitAfterValue(getDefrostText(state.defrost));
-      state.lastDefrostDescription = state.defrost;
-    }
-    if (state.haveOperatingMode &&
-        state.operatingMode != state.lastOperatingDescription) {
-      channels.mode->setUnitAfterValue(getOperatingModeText(state.operatingMode));
-      state.lastOperatingDescription = state.operatingMode;
-    }
-    if (state.haveFault &&
-        state.fault != state.lastFaultDescription) {
-      channels.fault->setUnitAfterValue(getFaultText(state.fault));
-      state.lastFaultDescription = state.fault;
-    }
-  }
 }
 
 
@@ -2927,8 +2777,8 @@ void loop() {
   handleRollbackVerification();
 
 
-  // Historia + teksty statusow GPM.
-  updateStatusDescriptions();
+  // Historia GPM i usuniecie starych opisow z jednostek.
+  handleGpmConfiguration();
 
 
   // =================================================

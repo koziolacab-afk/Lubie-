@@ -24,6 +24,7 @@ jobs:
           g++ -std=c++11 -Wall -Wextra -Werror tests/ds_sample_test.cpp -o /tmp/ds_sample_test
           /tmp/ds_sample_test
           python3 tests/qahv_binding_test.py
+          python3 tests/gpm_status_test.py
 
       - name: Zainstaluj Arduino CLI
         uses: arduino/setup-arduino-cli@v2

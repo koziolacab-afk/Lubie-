@@ -1,6 +1,6 @@
 # Rejestry Modbus w firmware
 
-Stan mapowania: firmware 1.0.21 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
+Stan mapowania: firmware 1.0.22 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
 Adresy ponizej to adresy przekazywane wprost do `readHoldingRegisters(adres, 1)`
 (adresowanie od zera w ramce Modbus), a nie numeracja 4xxxx z niektorych
 programow. Jezeli program konfiguracyjny numeruje rejestry od 1, sprawdz jego
@@ -21,7 +21,7 @@ czestotliwosc zalezy od obciazenia magistrali i odpowiedzi urzadzen.
 
 | Adres | Pompy | Interwal | Znaczenie / przeliczenie | Kanal SUPLA: CAHV 1 / CAHV 2 / QAHV |
 | ---: | --- | ---: | --- | --- |
-| 9 | wszystkie | 5 s | Kod bledu, surowa wartosc 16-bit | 5 / 20 / 34 |
+| 12 | wszystkie | 5 s | Kod bledu dziesietny: `8000` = wysylane `0`, pozostale kody bez zmian | 5 / 20 / 34 |
 | 25 | wszystkie | 5 s | System ON/OFF, surowa wartosc | 14 / 28 / 42 |
 | 26 | wszystkie | 5 s | Tryb pracy, surowy kod | 11 / 25 / 39 |
 | 30 | tylko QAHV | 60 s | Temperatura Thermo-off: `int16 / 100` °C | - / - / 45 |
@@ -44,8 +44,15 @@ Kody prezentowane przez firmware: odszranianie (67): `0` Normal, `1` Standby,
 `2` Defrost, `3` Wait restart. Tryb pracy (26): `0` Stop, `1` Hot water,
 `2` Heating, `3` Cooling, `4` DHW contact, `5` Freeze stat, `6` Legionella,
 `7` Heating Eco, `8` Mode 1, `9` Mode 2, `10` Mode 3, `11` Heat contact.
-Kod bledu (9): `0x8000` jest opisywany jako OK, `0x6999` jako Comm error,
-pozostale wartosci jako Fault; surowa liczba pozostaje widoczna w kanale.
+Od 1.0.22 statusy i kody bledow sa prezentowane jako same liczby bez
+dynamicznych opisow w jednostkach GPM. Zapisane wczesniej dopiski po wartosci
+(np. OK, Heating, Defrost) sa czyszczone po synchronizacji konfiguracji Cloud.
+Jednostki fizyczne innych kanalow (Hz, h, C, kWh) i historia pozostaja.
+Kod bledu jest odczytywany z HR12 (wariant dziesietny), zamiast HR9 (hex):
+`8000` oznacza brak bledu i jest wysylane do SUPLA jako `0`;
+np. `6999` oznaczajace blad komunikacji A1M-pompa jest wysylane jako `6999`.
+Pozostale kody sa wysylane bez zmian. Brak odpowiedzi RS485 nadal jest
+sygnalizowany kanalem lacznosci, a nie zastepowany kodem `0`.
 
 ## Sterowanie trybem CAHV
 
