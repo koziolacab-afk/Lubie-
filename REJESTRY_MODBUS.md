@@ -1,6 +1,6 @@
 # Rejestry Modbus w firmware
 
-Stan mapowania: firmware 1.0.22 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
+Stan mapowania: firmware 1.0.23 (`MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino`).
 Adresy ponizej to adresy przekazywane wprost do `readHoldingRegisters(adres, 1)`
 (adresowanie od zera w ramce Modbus), a nie numeracja 4xxxx z niektorych
 programow. Jezeli program konfiguracyjny numeruje rejestry od 1, sprawdz jego
@@ -176,11 +176,18 @@ Nie ma dodatkowego wybiegu pomp ani regulacji temperatury kotla;
 zabezpieczenia zapewnia jego wlasny sterownik.
 
 CH4 (GPIO42, kanal 64) wlacza cewke, aby WYLACZYC pompe podlaczona do NC.
-Pompa pracuje przy HR127 = 1 dowolnego CAHV LUB zapotrzebowaniu kotla na CO.
-Przy nieznanym/niepoprawnym/starym stanie dowolnego CAHV pompa pozostaje ON.
+Od 1.0.23 pompa pracuje, gdy dowolny CAHV ma HR26 = 2 (Heating) lub
+HR26 = 7 (Heating Eco), LUB gdy wystepuje zapotrzebowanie kotla na CO.
+HR127 pozostaje odczytem pracy jednostki w SUPLA, ale nie steruje CH4:
+zatrzymanie sprezarek po naladowaniu buforow nie wylacza obiegu odbiorczego.
+Przy nieznanym/niepoprawnym trybie (kod poza 0-11), braku komunikacji albo
+odczycie HR26 starszym niz 30 s dowolnego CAHV pompa pozostaje ON.
 Przy starcie GPIO42 jest LOW (cewka OFF, pompa ON).
-Pompa moze zostac wylaczona dopiero po swiezym potwierdzeniu zatrzymania
-obu CAHV i braku zapotrzebowania olejowego CO.
+Pompa moze zostac wylaczona dopiero po swiezym potwierdzeniu, ze oba CAHV
+sa poza trybami 2 i 7, oraz braku zapotrzebowania olejowego CO.
+Warunek opiera sie na HR26; samo System OFF w HR25 nie zatrzyma CH4,
+jezeli pompa nadal raportuje Heating/Heating Eco. QAHV i samo zapotrzebowanie
+olejowe CWU nie wlaczaja tego obiegu.
 Kanal 64 pokazuje stan cewki; kanal 80 pokazuje odwrocony stan obwodu NC.
 To stan wynikajacy z polecenia, bez niezaleznego potwierdzenia przeplywu.
 Kanaly 61-64 odrzucaja reczne polecenia Cloud i nie udostepniaja timera,

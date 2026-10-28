@@ -35,7 +35,7 @@
 // WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.22"
+#define FW_VERSION "1.0.23"
 
 
 // =====================================================
@@ -88,8 +88,8 @@ const char *const PUMP_NAMES[PUMP_COUNT] = {"CAHV 1", "CAHV 2", "QAHV"};
 const uint16_t SYSTEM_ON_REGISTER = 25;
 const uint16_t FAULT_DECIMAL_REGISTER = 12;
 const uint16_t OPERATING_MODE_REGISTER = 26;
-const uint16_t OPERATING_MODE_HEATING = 2;
-const uint16_t OPERATING_MODE_HEATING_ECO = 7;
+const uint16_t OPERATING_MODE_HEATING = BoilerLogic::HeatingMode;
+const uint16_t OPERATING_MODE_HEATING_ECO = BoilerLogic::HeatingEcoMode;
 const uint16_t THERMO_OFF_REGISTER = 30;
 const uint8_t QAHV_TH17_CHANNEL = 77;
 const uint8_t QAHV_EXTERNAL_SENSOR_COUNT = 2;
@@ -644,9 +644,9 @@ struct PumpState {
   double outdoorValue;
   unsigned long lastOutdoorSample;
   bool outdoorKnown;
-  unsigned long lastRunningSample;
-  bool runningKnown;
-  bool unitRunning;
+  unsigned long lastOperatingModeSample;
+  bool operatingModeKnown;
+  uint16_t operatingMode;
 };
 
 PumpState pumpState[PUMP_COUNT] = {};
@@ -870,7 +870,7 @@ void setModbusOnline(uint8_t pump, bool online) {
 
   if (!online) {
     state.outdoorKnown = false;
-    state.runningKnown = false;
+    state.operatingModeKnown = false;
     state.haveFlow = false;
     state.haveReturn = false;
     state.frequencyKnown = false;
@@ -1017,10 +1017,6 @@ void applyRegisterValue(
 
     case REG_HP_RUNNING: {
 
-      state.unitRunning = raw == 1;
-      state.runningKnown = raw <= 1;
-      state.lastRunningSample = millis();
-
       if (raw == 1) {
 
         channels.running->set();
@@ -1056,6 +1052,9 @@ void applyRegisterValue(
     case REG_OPERATING_MODE: {
 
       channels.mode->setValue(raw);
+      state.operatingMode = raw;
+      state.operatingModeKnown = raw <= 11;
+      state.lastOperatingModeSample = millis();
 
       if (pump < CAHV_COUNT && heatingEcoControl[pump] != nullptr) {
         heatingEcoControl[pump]->syncFromOperatingMode(raw);
@@ -2583,13 +2582,14 @@ void handleBoilerAutomation() {
   bool known[CAHV_COUNT] = {};
   for (uint8_t pump = 0; pump < CAHV_COUNT; pump++) {
     const PumpState &state = pumpState[pump];
-    // Unknown/stale CAHV status keeps the NC-connected circulation pump on.
-    known[pump] = BoilerLogic::fresh(state.online, state.runningKnown,
-                                    now, state.lastRunningSample);
+    // Heating mode remains active while compressors pause after charging buffers.
+    // Unknown/stale mode keeps the NC-connected circulation pump on.
+    known[pump] = BoilerLogic::fresh(state.online, state.operatingModeKnown,
+                                    now, state.lastOperatingModeSample);
   }
   bool secondaryOn = BoilerLogic::secondaryPump(
-      co, known[0], pumpState[0].unitRunning,
-      known[1], pumpState[1].unitRunning);
+      co, known[0], pumpState[0].operatingMode,
+      known[1], pumpState[1].operatingMode);
   for (uint8_t slot = 0; slot < QAHV_EXTERNAL_SENSOR_COUNT; slot++) {
     if (!BoilerLogic::fresh(pumpState[2].online, qahvExternalKnown[slot],
                            now, qahvExternalSampleAt[slot])) {
