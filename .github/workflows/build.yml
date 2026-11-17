@@ -25,6 +25,7 @@ jobs:
           /tmp/ds_sample_test
           python3 tests/qahv_binding_test.py
           python3 tests/gpm_status_test.py
+          python3 tests/config_after_migration_test.py
 
       - name: Zainstaluj Arduino CLI
         uses: arduino/setup-arduino-cli@v2
@@ -42,10 +43,10 @@ jobs:
       - name: Zainstaluj biblioteki
         run: |
           arduino-cli lib update-index
-          arduino-cli lib install "SuplaDevice"
-          arduino-cli lib install "ModbusMaster"
-          arduino-cli lib install "OneWire"
-          arduino-cli lib install "DallasTemperature"
+          arduino-cli lib install "SuplaDevice@26.9.2"
+          arduino-cli lib install "ModbusMaster@2.0.1"
+          arduino-cli lib install "OneWire@2.3.8"
+          arduino-cli lib install "DallasTemperature@4.0.6"
 
       - name: Kompilacja
         run: |
@@ -80,6 +81,8 @@ jobs:
           if gh release view ota > /dev/null 2>&1; then
             echo "Release ota istnieje - podmieniam firmware.bin"
             gh release upload ota build/firmware.bin --clobber
+            version=$(sed -n 's/^#define FW_VERSION "\([^"]*\)".*/\1/p' MelcoBEMS_SUPLA/MelcoBEMS_SUPLA.ino)
+            gh release edit ota --title "MelcoBEMS OTA ${version}"
           else
             echo "Tworze pierwszy Release ota"
             gh release create ota build/firmware.bin \

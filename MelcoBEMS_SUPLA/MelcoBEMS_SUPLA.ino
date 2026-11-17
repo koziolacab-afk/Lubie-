@@ -2,7 +2,6 @@
 
 #include <SuplaDevice.h>
 #include <supla/network/esp_wifi.h>
-#include <supla/storage/littlefs_config.h>
 #include <supla/network/esp_web_server.h>
 
 #include <supla/network/html/device_info.h>
@@ -26,6 +25,7 @@
 #include <string.h>
 #include "boiler_logic.h"
 #include "ds_sample.h"
+#include "config_after_migration.h"
 
 #include "esp_ota_ops.h"
 #include "esp_err.h"
@@ -35,7 +35,7 @@
 // WERSJA
 // =====================================================
 
-#define FW_VERSION "1.0.23"
+#define FW_VERSION "1.0.25"
 
 
 // =====================================================
@@ -152,7 +152,7 @@ const char *const RELAY_CAPTIONS[RELAY_COUNT] = {
 
 Supla::ESPWifi wifi;
 // The default 1024-byte config buffer cannot hold settings for all channels.
-Supla::LittleFsConfig configSupla(16384);
+ConfigAfterMigration configSupla(16384);
 Supla::EspWebServer suplaServer;
 
 
@@ -2775,7 +2775,6 @@ void loop() {
 
   // Walidacja firmware po OTA.
   handleRollbackVerification();
-
 
   // Historia GPM i usuniecie starych opisow z jednostek.
   handleGpmConfiguration();
