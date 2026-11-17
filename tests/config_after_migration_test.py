@@ -16,6 +16,7 @@ static SerialStub Serial;
     "LittleFS.h": r"""
 #pragma once
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <string>
