@@ -180,8 +180,8 @@ void confirmed(uint8_t state = 3) {
   strcpy(record.email, "new@example.test");
   memset(record.guid, 0x41, sizeof(record.guid));
   memset(record.authKey, 0x42, sizeof(record.authKey));
-  const auto *start = reinterpret_cast<const uint8_t *>(&record);
-  trial.assign(start, start + sizeof(record));
+  trial.resize(sizeof(record));
+  memcpy(trial.data(), &record, sizeof(record));
 }
 
 void checkNew(const ConfigAfterMigration &config) {
